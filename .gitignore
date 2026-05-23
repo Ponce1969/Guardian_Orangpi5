@@ -1,0 +1,27 @@
+# OpenCode / ATL
+.atl/
+
+# Rust build artifacts
+/target/
+
+# Environment secrets
+.env
+
+# Python virtual environment
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OpenSpec / SDD artifacts
+.openspec/
+
+# Engram local cache
+.engram/

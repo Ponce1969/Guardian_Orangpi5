@@ -1,0 +1,21 @@
+# GuardianRS Default Configuration
+# Copy to configs/guardian.yaml and adjust as needed.
+
+daemon:
+  poll_interval_secs: 30
+
+thresholds:
+  cpu_warning: 80
+  cpu_critical: 95
+  memory_warning: 85
+  memory_critical: 95
+  disk_warning: 80
+  disk_critical: 90
+  temp_warning: 70
+  temp_critical: 80
+
+notification:
+  discord:
+    enabled: true
+    webhook_url_env: DISCORD_WEBHOOK_URL
+    min_interval_secs: 300
