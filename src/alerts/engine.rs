@@ -1,5 +1,6 @@
 use chrono::Utc;
 use thiserror::Error;
+use tracing::debug;
 
 use crate::alerts::rules::ThresholdRule;
 use crate::alerts::state::{AlertSeverity, AlertState, AlertStateTracker};
@@ -88,15 +89,43 @@ impl AlertEvaluator for AlertEngine {
     fn evaluate(&mut self, snapshot: &MetricSnapshot) -> Vec<AlertEvent> {
         let new_state = match self.classify(snapshot.kind, snapshot.value) {
             Some(state) => state,
-            None => return Vec::new(), // No rule — nothing to evaluate.
+            None => {
+                debug!(
+                    metric = %snapshot.kind,
+                    value = snapshot.value,
+                    "No threshold rule for metric — skipping"
+                );
+                return Vec::new();
+            }
         };
 
         let old_state = self.tracker.get(snapshot.kind);
 
+        debug!(
+            metric = %snapshot.kind,
+            value = snapshot.value,
+            old_state = ?old_state,
+            new_state = ?new_state,
+            "Evaluated metric against thresholds"
+        );
+
         // Only emit an event on state transitions.
-        let Some(_prev) = self.tracker.transition(snapshot.kind, new_state) else {
+        let Some(prev) = self.tracker.transition(snapshot.kind, new_state) else {
+            debug!(
+                metric = %snapshot.kind,
+                value = snapshot.value,
+                state = ?new_state,
+                "No state transition — deduplication suppressing event"
+            );
             return Vec::new();
         };
+
+        debug!(
+            metric = %snapshot.kind,
+            from = ?prev,
+            to = ?new_state,
+            "State transition detected — generating alert"
+        );
 
         // At this point, old_state != new_state (guaranteed by transition).
         let severity = match (old_state, new_state) {

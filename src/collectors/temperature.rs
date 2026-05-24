@@ -88,6 +88,13 @@ impl Collector for TemperatureCollector {
 
         let celsius = Self::parse_millidegrees(&raw)?;
 
+        debug!(
+            metric = %MetricKind::Temperature,
+            value = celsius,
+            path = %self.path.display(),
+            "Collected temperature"
+        );
+
         Ok(MetricSnapshot::new(MetricKind::Temperature, celsius)
             .with_label("zone", "thermal_zone0"))
     }

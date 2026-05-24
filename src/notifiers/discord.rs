@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::alerts::state::AlertSeverity;
 use crate::alerts::AlertEvent;
@@ -125,11 +125,15 @@ impl Notifier for DiscordNotifier {
             })?;
 
         let status = response.status();
+        debug!(status = %status, "Discord webhook HTTP response");
+        info!(notifier = "discord", status = %status, "Discord webhook responded");
+
         if !status.is_success() {
             let body = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "<no body>".to_string());
+            debug!(status = %status, body = %body, "Discord webhook error response body");
             return Err(NotifierError::WebhookFailed {
                 status: status.as_u16(),
                 body,

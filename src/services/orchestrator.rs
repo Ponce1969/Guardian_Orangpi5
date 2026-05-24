@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::alerts::AlertEvaluator;
 use crate::collectors::Collector;
@@ -73,8 +73,10 @@ impl Orchestrator {
     /// Execute a single collection -> evaluate -> dispatch cycle.
     async fn tick(&mut self, _tick: u64) {
         // === Collect ===
+        debug!("Collection cycle starting");
         let mut handles = Vec::with_capacity(self.collectors.len());
         for collector in &self.collectors {
+            debug!(collector = collector.name(), "Dispatching collector");
             handles.push(collector.collect());
         }
 
@@ -82,7 +84,14 @@ impl Orchestrator {
         let snapshots: Vec<_> = results
             .into_iter()
             .filter_map(|r| match r {
-                Ok(snap) => Some(snap),
+                Ok(snap) => {
+                    debug!(
+                        collector = %snap.kind,
+                        value = snap.value,
+                        "Collection succeeded"
+                    );
+                    Some(snap)
+                }
                 Err(e) => {
                     error!(error = %e, "Collection failed");
                     None
@@ -95,13 +104,24 @@ impl Orchestrator {
             return;
         }
 
+        debug!(count = snapshots.len(), "Snapshots collected");
+
         // === Evaluate ===
         let mut events = Vec::new();
         for snapshot in &snapshots {
+            let prev_count = events.len();
             events.extend(self.alert_engine.evaluate(snapshot));
+            let new_events = events.len() - prev_count;
+            debug!(
+                metric = %snapshot.kind,
+                value = snapshot.value,
+                events_produced = new_events,
+                "Alert evaluation completed"
+            );
         }
 
         if events.is_empty() {
+            debug!("No alert events produced this cycle — all metrics within thresholds or no state transitions");
             return;
         }
 
@@ -109,9 +129,18 @@ impl Orchestrator {
 
         // === Dispatch ===
         for event in &events {
+            debug!(
+                metric = %event.metric,
+                severity = %event.severity,
+                value = event.value,
+                "Dispatching alert event to notifiers"
+            );
             for notifier in &self.notifiers {
+                debug!(notifier = notifier.name(), "Sending to notifier");
                 if let Err(e) = notifier.send(event).await {
                     error!(notifier = notifier.name(), error = %e, "Notification failed");
+                } else {
+                    debug!(notifier = notifier.name(), "Notification succeeded");
                 }
             }
         }
