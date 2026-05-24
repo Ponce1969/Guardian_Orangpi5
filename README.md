@@ -98,6 +98,13 @@ All thresholds are configurable via `configs/guardian.yaml`.
 
 ## Quick Start
 
+### Clone
+
+```bash
+git clone https://github.com/Ponce1969/Guardian_Orangpi5.git
+cd Guardian_Orangpi5
+```
+
 ### Prerequisites
 
 - Rust stable (1.75+)
