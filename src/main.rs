@@ -17,13 +17,13 @@ fn main() -> Result<()> {
     // Load .env file (does not crash if missing — production uses system env vars)
     dotenvy::dotenv().ok();
 
-    // Initialize tracing subscriber
-    // Default to debug level for pipeline observability.
-    // Override with RUST_LOG=info or RUST_LOG=warn for less verbosity.
+    // Initialize tracing subscriber.
+    // Default level is info — clean, production-ready output.
+    // Override with RUST_LOG=debug for detailed pipeline observability.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -33,17 +33,6 @@ fn main() -> Result<()> {
     info!(
         poll_interval = config.daemon.poll_interval_secs,
         "Poll interval configured"
-    );
-    tracing::debug!(
-        cpu_warning = config.thresholds.cpu_warning,
-        cpu_critical = config.thresholds.cpu_critical,
-        memory_warning = config.thresholds.memory_warning,
-        memory_critical = config.thresholds.memory_critical,
-        disk_warning = config.thresholds.disk_warning,
-        disk_critical = config.thresholds.disk_critical,
-        temp_warning = config.thresholds.temp_warning,
-        temp_critical = config.thresholds.temp_critical,
-        "Threshold configuration"
     );
 
     // === Collectors ===

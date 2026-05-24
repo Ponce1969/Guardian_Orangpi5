@@ -16,7 +16,7 @@ pub struct ThresholdRule {
 /// This keeps the conversion logic in one place so the AlertEngine
 /// stays focused on evaluation, not config mapping.
 pub fn rules_from_config(config: &crate::config::ThresholdsConfig) -> Vec<ThresholdRule> {
-    let rules = vec![
+    vec![
         ThresholdRule {
             metric: MetricKind::CpuUsage,
             warning: config.cpu_warning,
@@ -37,18 +37,7 @@ pub fn rules_from_config(config: &crate::config::ThresholdsConfig) -> Vec<Thresh
             warning: config.temp_warning,
             critical: config.temp_critical,
         },
-    ];
-
-    for rule in &rules {
-        tracing::debug!(
-            metric = %rule.metric,
-            warning = rule.warning,
-            critical = rule.critical,
-            "Loaded threshold rule"
-        );
-    }
-
-    rules
+    ]
 }
 
 /// Re-export ThresholdsConfig as a type alias for clarity.

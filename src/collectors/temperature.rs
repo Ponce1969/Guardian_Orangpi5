@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use tracing::debug;
 
 use crate::collectors::{Collector, CollectorError};
 use crate::metrics::{MetricKind, MetricSnapshot};
@@ -84,16 +83,7 @@ impl Collector for TemperatureCollector {
                 source: e,
             })?;
 
-        debug!(raw = %raw.trim(), "Read thermal zone");
-
         let celsius = Self::parse_millidegrees(&raw)?;
-
-        debug!(
-            metric = %MetricKind::Temperature,
-            value = celsius,
-            path = %self.path.display(),
-            "Collected temperature"
-        );
 
         Ok(MetricSnapshot::new(MetricKind::Temperature, celsius)
             .with_label("zone", "thermal_zone0"))
