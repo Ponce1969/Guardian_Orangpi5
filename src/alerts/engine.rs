@@ -144,7 +144,8 @@ impl AlertEvaluator for AlertEngine {
         let threshold = match severity {
             AlertSeverity::Critical => rule.map(|r| r.critical).unwrap_or(0.0),
             AlertSeverity::Warning => rule.map(|r| r.warning).unwrap_or(0.0),
-            AlertSeverity::Recovered => 0.0,
+            // Recovery: show the threshold we recovered FROM.
+            AlertSeverity::Recovered => rule.map(|r| r.warning).unwrap_or(0.0),
         };
 
         let unit = snapshot.kind.unit();
