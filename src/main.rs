@@ -64,7 +64,10 @@ fn main() -> Result<()> {
 
     if config.notification.discord.enabled {
         let webhook_url = config.notification.discord.webhook_url().to_string();
-        let discord = DiscordNotifier::new(webhook_url);
+        let hostname = gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "unknown".to_string());
+        let discord = DiscordNotifier::new(webhook_url, hostname);
         notifiers.push(Box::new(discord));
         info!("Discord notifier enabled");
     } else {

@@ -42,6 +42,19 @@ impl MetricKind {
             Self::NetworkThroughput => "MB/s",
         }
     }
+
+    /// Returns a human-readable display name for this metric kind.
+    ///
+    /// Used in alert titles and Discord embed fields.
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::CpuUsage => "CPU Usage",
+            Self::MemoryUsage => "Memory Usage",
+            Self::DiskUsage => "Disk Usage",
+            Self::Temperature => "Temperature",
+            Self::NetworkThroughput => "Network Throughput",
+        }
+    }
 }
 
 /// A single metric measurement produced by a Collector.
