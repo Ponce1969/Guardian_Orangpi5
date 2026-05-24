@@ -2,6 +2,7 @@ pub mod engine;
 pub mod rules;
 pub mod state;
 
+pub use engine::AlertEngine;
 pub use engine::AlertEvaluator;
 pub use rules::{ThresholdRule, ThresholdsConfig};
 pub use state::{AlertSeverity, AlertState, AlertStateTracker};

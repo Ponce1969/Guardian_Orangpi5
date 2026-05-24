@@ -26,6 +26,24 @@ impl std::fmt::Display for MetricKind {
     }
 }
 
+impl MetricKind {
+    /// Returns the display unit for this metric kind.
+    ///
+    /// Used in alert messages to show correct units:
+    /// - Percentage metrics use `%`
+    /// - Temperature uses `°C`
+    /// - Network uses appropriate throughput units
+    pub fn unit(&self) -> &str {
+        match self {
+            Self::CpuUsage => "%",
+            Self::MemoryUsage => "%",
+            Self::DiskUsage => "%",
+            Self::Temperature => "°C",
+            Self::NetworkThroughput => "MB/s",
+        }
+    }
+}
+
 /// A single metric measurement produced by a Collector.
 ///
 /// Collectors emit one `MetricSnapshot` per collection cycle.

@@ -53,6 +53,11 @@ impl AlertEngine {
         }
     }
 
+    /// Returns the number of threshold rules loaded into the engine.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
     /// Find the threshold rule for a given metric kind.
     fn find_rule(&self, kind: MetricKind) -> Option<&ThresholdRule> {
         self.rules.iter().find(|r| r.metric == kind)
@@ -113,9 +118,10 @@ impl AlertEvaluator for AlertEngine {
             AlertSeverity::Recovered => 0.0,
         };
 
+        let unit = snapshot.kind.unit();
         let message = format!(
-            "{} {} is {:.1}% (threshold: {:.1}%)",
-            snapshot.kind, severity, snapshot.value, threshold,
+            "{} {} is {:.1}{} (threshold: {:.1}{})",
+            snapshot.kind, severity, snapshot.value, unit, threshold, unit,
         );
 
         vec![AlertEvent {

@@ -1,7 +1,17 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use tracing::info;
 
+use guardian_rs::alerts::engine::AlertEngine;
+use guardian_rs::alerts::rules::rules_from_config;
+use guardian_rs::collectors::temperature::TemperatureCollector;
+use guardian_rs::collectors::Collector;
 use guardian_rs::config;
+use guardian_rs::notifiers::discord::DiscordNotifier;
+use guardian_rs::notifiers::log::LogNotifier;
+use guardian_rs::notifiers::Notifier;
+use guardian_rs::services::orchestrator::Orchestrator;
 
 fn main() -> Result<()> {
     // Load .env file (does not crash if missing — production uses system env vars)
@@ -23,9 +33,41 @@ fn main() -> Result<()> {
         "Poll interval configured"
     );
 
-    // TODO: wire up collectors, alert engine, notifiers, orchestrator
-    // TODO: run orchestrator loop
+    // === Collectors ===
+    let temperature_collector = TemperatureCollector::new();
+    let collectors: Vec<Box<dyn Collector>> = vec![Box::new(temperature_collector)];
+    info!(count = collectors.len(), "Collectors initialized");
 
-    info!("GuardianRS started");
+    // === Alert Engine ===
+    let rules = rules_from_config(&config.thresholds);
+    let alert_engine = AlertEngine::new(rules);
+    info!(
+        rules = alert_engine.rule_count(),
+        "Alert engine initialized"
+    );
+
+    // === Notifiers ===
+    let mut notifiers: Vec<Box<dyn Notifier>> = vec![Box::new(LogNotifier::new())];
+
+    if config.notification.discord.enabled {
+        let webhook_url = config.notification.discord.webhook_url().to_string();
+        let discord = DiscordNotifier::new(webhook_url);
+        notifiers.push(Box::new(discord));
+        info!("Discord notifier enabled");
+    } else {
+        info!("Discord notifier disabled");
+    }
+
+    // === Orchestrator ===
+    let poll_interval = Duration::from_secs(config.daemon.poll_interval_secs);
+    let orchestrator =
+        Orchestrator::new(collectors, Box::new(alert_engine), notifiers, poll_interval);
+
+    info!("Starting GuardianRS daemon");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(orchestrator.run())?;
+
     Ok(())
 }

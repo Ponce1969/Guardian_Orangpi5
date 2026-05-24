@@ -1,3 +1,7 @@
+pub mod temperature;
+
+pub use temperature::TemperatureCollector;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
