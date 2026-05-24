@@ -207,4 +207,129 @@ mod tests {
         let events = engine.evaluate(&snap(MetricKind::CpuUsage, 50.0));
         assert!(events.is_empty());
     }
+
+    // === CPU alert state transition integration tests ===
+
+    fn cpu_rules() -> Vec<ThresholdRule> {
+        vec![ThresholdRule {
+            metric: MetricKind::CpuUsage,
+            warning: 80.0,
+            critical: 95.0,
+        }]
+    }
+
+    #[test]
+    fn cpu_normal_to_warning() {
+        let mut engine = AlertEngine::new(cpu_rules());
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 85.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+        assert_eq!(events[0].metric, MetricKind::CpuUsage);
+    }
+
+    #[test]
+    fn cpu_normal_to_critical() {
+        let mut engine = AlertEngine::new(cpu_rules());
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 97.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn cpu_warning_to_critical() {
+        let mut engine = AlertEngine::new(cpu_rules());
+        engine.evaluate(&snap(MetricKind::CpuUsage, 82.0));
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 96.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn cpu_warning_to_normal_recovers() {
+        let mut engine = AlertEngine::new(cpu_rules());
+        engine.evaluate(&snap(MetricKind::CpuUsage, 85.0));
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 40.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+    }
+
+    #[test]
+    fn cpu_steady_warning_no_flapping() {
+        let mut engine = AlertEngine::new(cpu_rules());
+        engine.evaluate(&snap(MetricKind::CpuUsage, 82.0));
+        // Repeated readings in warning range produce no event
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 84.0))
+            .is_empty());
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 90.0))
+            .is_empty());
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 81.0))
+            .is_empty());
+    }
+
+    #[test]
+    fn cpu_spike_does_not_flap_with_ema_values() {
+        // Simulates EMA-smoothed values: 20 -> 50 -> 85 -> 50 -> 20
+        let mut engine = AlertEngine::new(cpu_rules());
+
+        // Normal
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 20.0))
+            .is_empty());
+        // Rising but still normal
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 50.0))
+            .is_empty());
+        // Spike to warning
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 85.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+        // Coming back down
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 50.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+        // Back to normal
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 20.0))
+            .is_empty());
+    }
+
+    #[test]
+    fn cpu_and_temperature_independent_alerts() {
+        let mut engine = AlertEngine::new(vec![
+            ThresholdRule {
+                metric: MetricKind::CpuUsage,
+                warning: 80.0,
+                critical: 95.0,
+            },
+            ThresholdRule {
+                metric: MetricKind::Temperature,
+                warning: 70.0,
+                critical: 80.0,
+            },
+        ]);
+
+        // CPU goes to warning
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 85.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::CpuUsage);
+
+        // Temperature independently goes to warning
+        let events = engine.evaluate(&snap(MetricKind::Temperature, 72.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::Temperature);
+
+        // CPU recovers but temperature stays in warning
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 50.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::CpuUsage);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        // Temperature still in warning — no repeated event
+        assert!(engine
+            .evaluate(&snap(MetricKind::Temperature, 73.0))
+            .is_empty());
+    }
 }

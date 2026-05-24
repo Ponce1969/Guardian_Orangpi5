@@ -5,6 +5,7 @@ use tracing::info;
 
 use guardian_rs::alerts::engine::AlertEngine;
 use guardian_rs::alerts::rules::rules_from_config;
+use guardian_rs::collectors::cpu::CpuCollector;
 use guardian_rs::collectors::temperature::TemperatureCollector;
 use guardian_rs::collectors::Collector;
 use guardian_rs::config;
@@ -36,8 +37,10 @@ fn main() -> Result<()> {
     );
 
     // === Collectors ===
+    let cpu_collector = CpuCollector::new();
     let temperature_collector = TemperatureCollector::new();
-    let collectors: Vec<Box<dyn Collector>> = vec![Box::new(temperature_collector)];
+    let collectors: Vec<Box<dyn Collector>> =
+        vec![Box::new(cpu_collector), Box::new(temperature_collector)];
     info!(count = collectors.len(), "Collectors initialized");
 
     // === Alert Engine ===
