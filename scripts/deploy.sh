@@ -66,6 +66,12 @@ else
     log_info "Installation directory exists: ${INSTALL_DIR}"
 fi
 
+# === Stop service if running (avoids "Text file busy" on binary copy) ===
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    log_info "Stopping running service..."
+    systemctl stop "$SERVICE_NAME" || true
+fi
+
 # === Copy binary ===
 log_info "Installing binary..."
 cp "$BINARY_SOURCE" "${INSTALL_DIR}/${BINARY_NAME}"
