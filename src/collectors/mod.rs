@@ -1,7 +1,9 @@
 pub mod cpu;
+pub mod memory;
 pub mod temperature;
 
 pub use cpu::CpuCollector;
+pub use memory::MemoryCollector;
 pub use temperature::TemperatureCollector;
 
 use async_trait::async_trait;

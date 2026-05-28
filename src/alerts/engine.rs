@@ -332,4 +332,167 @@ mod tests {
             .evaluate(&snap(MetricKind::Temperature, 73.0))
             .is_empty());
     }
+
+    // === Memory alert state transition integration tests ===
+
+    fn memory_rules() -> Vec<ThresholdRule> {
+        vec![ThresholdRule {
+            metric: MetricKind::MemoryUsage,
+            warning: 85.0,
+            critical: 95.0,
+        }]
+    }
+
+    #[test]
+    fn memory_normal_to_warning() {
+        let mut engine = AlertEngine::new(memory_rules());
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 87.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+        assert_eq!(events[0].metric, MetricKind::MemoryUsage);
+    }
+
+    #[test]
+    fn memory_normal_to_critical() {
+        let mut engine = AlertEngine::new(memory_rules());
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 97.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn memory_warning_to_critical() {
+        let mut engine = AlertEngine::new(memory_rules());
+        engine.evaluate(&snap(MetricKind::MemoryUsage, 87.0));
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 96.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn memory_warning_to_normal_recovers() {
+        let mut engine = AlertEngine::new(memory_rules());
+        engine.evaluate(&snap(MetricKind::MemoryUsage, 87.0));
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 50.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+    }
+
+    #[test]
+    fn memory_critical_to_warning_recovers() {
+        let mut engine = AlertEngine::new(memory_rules());
+        engine.evaluate(&snap(MetricKind::MemoryUsage, 96.0)); // -> Critical
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 88.0)); // -> Warning (recovered from Critical)
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+    }
+
+    #[test]
+    fn memory_steady_warning_no_flapping() {
+        let mut engine = AlertEngine::new(memory_rules());
+        engine.evaluate(&snap(MetricKind::MemoryUsage, 87.0));
+        // Repeated readings in warning range produce no event
+        assert!(engine
+            .evaluate(&snap(MetricKind::MemoryUsage, 90.0))
+            .is_empty());
+        assert!(engine
+            .evaluate(&snap(MetricKind::MemoryUsage, 86.0))
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_first_normal_reading_no_event() {
+        let mut engine = AlertEngine::new(memory_rules());
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 50.0));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn memory_pressure_lifecycle() {
+        // Simulates realistic Docker-heavy server: gradual memory pressure -> alert -> recovery
+        let mut engine = AlertEngine::new(memory_rules());
+
+        // Normal baseline
+        assert!(engine
+            .evaluate(&snap(MetricKind::MemoryUsage, 40.0))
+            .is_empty());
+
+        // Growing pressure but still normal
+        assert!(engine
+            .evaluate(&snap(MetricKind::MemoryUsage, 70.0))
+            .is_empty());
+
+        // Crosses warning threshold
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 86.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+
+        // Continued high pressure — no repeat
+        assert!(engine
+            .evaluate(&snap(MetricKind::MemoryUsage, 89.0))
+            .is_empty());
+
+        // Container OOM spike — escalates to critical
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 96.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+
+        // Container killed, memory freed — recovers
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 60.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        // Back to normal baseline
+        assert!(engine
+            .evaluate(&snap(MetricKind::MemoryUsage, 30.0))
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_independent_of_cpu_and_temperature() {
+        let mut engine = AlertEngine::new(vec![
+            ThresholdRule {
+                metric: MetricKind::CpuUsage,
+                warning: 80.0,
+                critical: 95.0,
+            },
+            ThresholdRule {
+                metric: MetricKind::MemoryUsage,
+                warning: 85.0,
+                critical: 95.0,
+            },
+            ThresholdRule {
+                metric: MetricKind::Temperature,
+                warning: 70.0,
+                critical: 80.0,
+            },
+        ]);
+
+        // Memory goes to warning
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 88.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::MemoryUsage);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+
+        // CPU independently goes to warning
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 85.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::CpuUsage);
+
+        // Temperature stays normal — no event for other metrics
+        assert!(engine
+            .evaluate(&snap(MetricKind::Temperature, 50.0))
+            .is_empty());
+
+        // Memory recovers
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 60.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::MemoryUsage);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        // CPU still in warning — no repeated event
+        assert!(engine
+            .evaluate(&snap(MetricKind::CpuUsage, 82.0))
+            .is_empty());
+    }
 }
