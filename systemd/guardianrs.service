@@ -1,0 +1,31 @@
+[Unit]
+Description=GuardianRS Infrastructure Monitoring Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=guardianrs
+Group=guardianrs
+WorkingDirectory=/opt/guardianrs
+ExecStart=/opt/guardianrs/guardian-rs
+EnvironmentFile=/opt/guardianrs/.env
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/proc /sys
+
+# Logging — journald integration
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=guardianrs
+
+[Install]
+WantedBy=multi-user.target

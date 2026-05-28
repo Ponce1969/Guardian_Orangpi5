@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::oneshot;
 use tracing::info;
 
 use guardian_rs::alerts::engine::AlertEngine;
@@ -16,7 +17,7 @@ use guardian_rs::notifiers::Notifier;
 use guardian_rs::services::orchestrator::Orchestrator;
 
 fn main() -> Result<()> {
-    // Load .env file (does not crash if missing — production uses system env vars)
+    // Load .env file (does not crash if missing — production uses systemd EnvironmentFile)
     dotenvy::dotenv().ok();
 
     // Initialize tracing subscriber.
@@ -77,10 +78,54 @@ fn main() -> Result<()> {
         Orchestrator::new(collectors, Box::new(alert_engine), notifiers, poll_interval);
 
     info!("Starting GuardianRS daemon");
-    tokio::runtime::Builder::new_current_thread()
+
+    // Create shutdown channel — first signal wins, duplicates are ignored
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Build multi-thread runtime for signal handling.
+    // worker_threads=2 is sufficient: one for signal listener, one for orchestrator tick.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
-        .build()?
-        .block_on(orchestrator.run())?;
+        .build()?;
+
+    rt.block_on(async {
+        // Spawn signal handler(s).
+        // On Unix: listen for both SIGTERM (systemd) and Ctrl+C (interactive).
+        // On other platforms: listen for Ctrl+C only.
+        // A single oneshot channel ensures first signal wins — duplicates are ignored.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            tokio::spawn(async move {
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, initiating shutdown");
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Ctrl+C received, initiating shutdown");
+                    }
+                }
+                let _ = shutdown_tx.send(());
+            });
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to listen for ctrl+c");
+                info!("Ctrl+C received, initiating shutdown");
+                let _ = shutdown_tx.send(());
+            });
+        }
+
+        // Run orchestrator with shutdown receiver
+        orchestrator.run(shutdown_rx).await
+    })?;
 
     Ok(())
 }

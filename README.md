@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/Platform-ARM64%20Linux-FF8C00?style=flat-square&logo=linux&logoColor=white)](https://www.arm.com/)
 [![License](https://img.shields.io/badge/License-All%20Rights%20Reserved-red?style=flat-square)](./LICENSE)
 
-[![CI](https://img.shields.io/badge/tests-16%20passing-brightgreen?style=flat-square)](./)
+[![CI](https://img.shields.io/badge/tests-75%20passing-brightgreen?style=flat-square)](./)
 [![Clippy](https://img.shields.io/badge/clippy-clean-brightgreen?style=flat-square)](./)
 [![fmt](https://img.shields.io/badge/cargo%20fmt-clean-brightgreen?style=flat-square)](./)
 
@@ -76,12 +76,12 @@ Alerts follow a **state machine** with built-in deduplication — only state tra
 
 ### Collectors
 
-| Collector | Source | Metric |
-|-----------|--------|--------|
-| CPU | `/proc/stat` | Usage percentage |
-| Memory | `/proc/meminfo` | Usage percentage |
-| Disk | `statfs` on `/` | Usage percentage |
-| Temperature | `/sys/class/thermal/thermal_zone0/temp` | SoC temperature (°C) |
+| Collector | Source | Metric | Status |
+|-----------|--------|--------|--------|
+| CPU | `/proc/stat` | Usage percentage | ✅ |
+| Memory | `/proc/meminfo` | Usage percentage | ✅ |
+| Temperature | `/sys/class/thermal/thermal_zone0/temp` | SoC temperature (°C) | ✅ |
+| Disk | `statfs` on `/` | Usage percentage | 🔜 |
 
 ### Thresholds
 
@@ -147,6 +147,51 @@ Or run the binary directly:
 
 ---
 
+## Deployment
+
+GuardianRS uses **systemd** for production operation on ARM Linux. The service runs as a non-root user (`guardianrs`) with security hardening and automatic restart on failure.
+
+### Quick Deploy
+
+```bash
+sudo bash scripts/deploy.sh
+```
+
+The deploy script handles everything:
+- Creates `guardianrs` system user
+- Installs binary to `/opt/guardianrs/`
+- Copies configuration and `.env` file
+- Installs and starts the systemd service
+- Shows initial status
+
+### Operational Commands
+
+| Action | Command |
+|--------|---------|
+| Start service | `sudo systemctl start guardianrs` |
+| Stop service | `sudo systemctl stop guardianrs` |
+| Restart service | `sudo systemctl restart guardianrs` |
+| Check status | `sudo systemctl status guardianrs` |
+| View live logs | `sudo journalctl -u guardianrs -f` |
+
+### Log Examples
+
+```bash
+# Follow logs in real-time
+sudo journalctl -u guardianrs -f
+
+# View last 100 log lines
+sudo journalctl -u guardianrs -n 100
+
+# Filter by error priority
+sudo journalctl -u guardianrs -p err
+
+# Show logs since last boot
+sudo journalctl -u guardianrs -b
+```
+
+---
+
 ## Configuration
 
 Configuration is split between **YAML** (thresholds, intervals) and **environment variables** (secrets). No webhooks, passwords, or tokens are ever stored in YAML or code.
@@ -181,23 +226,34 @@ notification:
 
 ```
 src/
-├── main.rs              # Entry point, config loading, tracing setup
+├── main.rs              # Entry point, config loading, signal handling, tracing
 ├── config.rs            # YAML + env var configuration
 ├── metrics/
 │   ├── mod.rs
 │   └── types.rs         # MetricSnapshot, MetricKind
 ├── collectors/
-│   └── mod.rs           # Collector trait, CollectorError
+│   ├── mod.rs           # Collector trait, CollectorError
+│   ├── cpu.rs           # CpuCollector (EMA-smoothed /proc/stat reader)
+│   ├── memory.rs         # MemoryCollector (/proc/meminfo reader)
+│   └── temperature.rs    # TemperatureCollector (thermal zone reader)
 ├── alerts/
 │   ├── mod.rs           # AlertEvent
 │   ├── engine.rs        # AlertEvaluator trait, AlertEngine impl
 │   ├── rules.rs         # ThresholdRule, rules_from_config()
 │   └── state.rs         # AlertSeverity, AlertState, AlertStateTracker
 ├── notifiers/
-│   └── mod.rs           # Notifier trait, NotifierError
+│   ├── mod.rs           # Notifier trait, NotifierError
+│   ├── discord.rs       # DiscordNotifier (rich embeds with severity colors)
+│   └── log.rs           # LogNotifier (structured tracing fallback)
 └── services/
     ├── mod.rs
-    └── orchestrator.rs  # collect → evaluate → dispatch loop
+    └── orchestrator.rs  # collect → evaluate → dispatch loop with graceful shutdown
+
+systemd/
+└── guardianrs.service   # systemd unit with security hardening
+
+scripts/
+└── deploy.sh            # Idempotent deployment for Orange Pi
 ```
 
 ### Core Traits
@@ -217,12 +273,15 @@ src/
 - [x] Core contracts and traits (Collector, AlertEvaluator, Notifier)
 - [x] Alert state machine with deduplication
 - [x] YAML + env configuration system
-- [x] 16 unit tests passing
-- [ ] Concrete collectors (CPU, Memory, Disk, Temperature)
-- [ ] Discord notifier with embed formatting
-- [ ] Log notifier (structured tracing)
-- [ ] Wire everything in `main.rs`
-- [ ] systemd unit file
+- [x] 75 unit tests passing
+- [x] Concrete collectors (CPU, Memory, Temperature)
+- [x] Discord notifier with embed formatting
+- [x] Log notifier (structured tracing)
+- [x] Wire everything in `main.rs`
+- [x] Graceful shutdown (SIGTERM + Ctrl+C)
+- [x] systemd unit file with security hardening
+- [x] Deployment script (`scripts/deploy.sh`)
+- [ ] Disk collector (`statfs` on `/`)
 - [ ] Cross-compilation for `aarch64-unknown-linux-gnu`
 
 ### Phase 2 — Extended Monitoring
@@ -244,7 +303,7 @@ src/
 ```bash
 cargo fmt --check          # Format check
 cargo clippy --all-targets  # Lint check
-cargo test                  # Run 16 unit tests
+cargo test                  # Run 75 unit tests
 ```
 
 ---

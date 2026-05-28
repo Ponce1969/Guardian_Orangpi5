@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use futures::future::join_all;
+use tokio::sync::oneshot;
 use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::alerts::AlertEvaluator;
-use crate::collectors::CollectorError;
 use crate::collectors::Collector;
+use crate::collectors::CollectorError;
 use crate::notifiers::Notifier;
 
 /// The Orchestrator wires collectors, the alert engine, and notifiers
@@ -50,7 +51,11 @@ impl Orchestrator {
     ///
     /// This method consumes `self` because the loop is intended to
     /// run for the lifetime of the process.
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    ///
+    /// # Arguments
+    ///
+    /// * `shutdown_rx` - Oneshot receiver that triggers graceful shutdown
+    pub async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> anyhow::Result<()> {
         info!(
             interval_secs = self.poll_interval.as_secs(),
             "Starting GuardianRS orchestrator"
@@ -60,15 +65,24 @@ impl Orchestrator {
         let mut tick: u64 = 0;
 
         loop {
-            ticker.tick().await;
-            tick += 1;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    tick += 1;
 
-            if tick.is_multiple_of(10) {
-                info!(tick, "Collection cycle");
+                    if tick.is_multiple_of(10) {
+                        info!(tick, "Collection cycle");
+                    }
+
+                    self.tick(tick).await;
+                }
+                _ = &mut shutdown_rx => {
+                    info!("Shutdown signal received, stopping GuardianRS");
+                    break;
+                }
             }
-
-            self.tick(tick).await;
         }
+
+        Ok(())
     }
 
     /// Execute a single collection -> evaluate -> dispatch cycle.
