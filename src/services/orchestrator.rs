@@ -5,6 +5,7 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::alerts::AlertEvaluator;
+use crate::collectors::CollectorError;
 use crate::collectors::Collector;
 use crate::notifiers::Notifier;
 
@@ -83,6 +84,10 @@ impl Orchestrator {
             .into_iter()
             .filter_map(|r| match r {
                 Ok(snap) => Some(snap),
+                Err(e @ CollectorError::Unavailable { .. }) => {
+                    warn!(error = %e, "Collector warming up");
+                    None
+                }
                 Err(e) => {
                     error!(error = %e, "Collection failed");
                     None
