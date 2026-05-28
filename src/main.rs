@@ -30,8 +30,14 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // Load configuration from YAML + env vars
-    let config = config::load("configs/guardian.yaml")?;
+    // Load configuration from YAML + env vars.
+    // Try production path first (/opt/guardianrs/), then development path.
+    let config_path = if std::path::Path::new("/opt/guardianrs/guardian.yaml").exists() {
+        "/opt/guardianrs/guardian.yaml"
+    } else {
+        "configs/guardian.yaml"
+    };
+    let config = config::load(config_path)?;
     info!("GuardianRS configuration loaded");
     info!(
         poll_interval = config.daemon.poll_interval_secs,
