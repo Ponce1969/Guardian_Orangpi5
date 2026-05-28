@@ -1,6 +1,6 @@
 [Unit]
 Description=GuardianRS Infrastructure Monitoring Daemon
-After=network-online.target
+After=network.target
 Wants=network-online.target
 
 [Service]
