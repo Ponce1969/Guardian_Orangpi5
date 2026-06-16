@@ -7,6 +7,7 @@ use tracing::info;
 use guardian_rs::alerts::engine::AlertEngine;
 use guardian_rs::alerts::rules::rules_from_config;
 use guardian_rs::collectors::cpu::CpuCollector;
+use guardian_rs::collectors::disk::DiskCollector;
 use guardian_rs::collectors::memory::MemoryCollector;
 use guardian_rs::collectors::temperature::TemperatureCollector;
 use guardian_rs::collectors::Collector;
@@ -47,10 +48,12 @@ fn main() -> Result<()> {
     // === Collectors ===
     let cpu_collector = CpuCollector::new();
     let memory_collector = MemoryCollector::new();
+    let disk_collector = DiskCollector::new();
     let temperature_collector = TemperatureCollector::new();
     let collectors: Vec<Box<dyn Collector>> = vec![
         Box::new(cpu_collector),
         Box::new(memory_collector),
+        Box::new(disk_collector),
         Box::new(temperature_collector),
     ];
     info!(count = collectors.len(), "Collectors initialized");

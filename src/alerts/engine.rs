@@ -495,4 +495,178 @@ mod tests {
             .evaluate(&snap(MetricKind::CpuUsage, 82.0))
             .is_empty());
     }
+
+    // === Disk alert state transition integration tests ===
+
+    fn disk_rules() -> Vec<ThresholdRule> {
+        vec![ThresholdRule {
+            metric: MetricKind::DiskUsage,
+            warning: 80.0,
+            critical: 90.0,
+        }]
+    }
+
+    #[test]
+    fn disk_normal_to_warning() {
+        let mut engine = AlertEngine::new(disk_rules());
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 82.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+        assert_eq!(events[0].metric, MetricKind::DiskUsage);
+    }
+
+    #[test]
+    fn disk_normal_to_critical() {
+        let mut engine = AlertEngine::new(disk_rules());
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 93.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn disk_warning_to_critical() {
+        let mut engine = AlertEngine::new(disk_rules());
+        engine.evaluate(&snap(MetricKind::DiskUsage, 82.0));
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 91.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn disk_warning_to_normal_recovers() {
+        let mut engine = AlertEngine::new(disk_rules());
+        engine.evaluate(&snap(MetricKind::DiskUsage, 85.0));
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 70.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+    }
+
+    #[test]
+    fn disk_critical_to_warning_recovers() {
+        let mut engine = AlertEngine::new(disk_rules());
+        engine.evaluate(&snap(MetricKind::DiskUsage, 92.0)); // -> Critical
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 85.0)); // -> Warning (Recovered from Critical)
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+    }
+
+    #[test]
+    fn disk_steady_warning_no_flapping() {
+        let mut engine = AlertEngine::new(disk_rules());
+        engine.evaluate(&snap(MetricKind::DiskUsage, 82.0));
+        assert!(engine
+            .evaluate(&snap(MetricKind::DiskUsage, 85.0))
+            .is_empty());
+        assert!(engine
+            .evaluate(&snap(MetricKind::DiskUsage, 81.0))
+            .is_empty());
+    }
+
+    #[test]
+    fn disk_first_normal_reading_no_event() {
+        let mut engine = AlertEngine::new(disk_rules());
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 50.0));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn disk_filling_lifecycle() {
+        // Simulates a Docker-heavy Orange Pi: disk slowly filling up
+        let mut engine = AlertEngine::new(disk_rules());
+
+        // Normal baseline
+        assert!(engine
+            .evaluate(&snap(MetricKind::DiskUsage, 45.0))
+            .is_empty());
+
+        // Growing but still normal
+        assert!(engine
+            .evaluate(&snap(MetricKind::DiskUsage, 65.0))
+            .is_empty());
+
+        // Crosses warning threshold — Docker images filling disk
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 82.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
+
+        // Continued growth — no repeat
+        assert!(engine
+            .evaluate(&snap(MetricKind::DiskUsage, 86.0))
+            .is_empty());
+
+        // Critical — disk nearly full
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 92.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Critical);
+
+        // Cleanup — Docker prune frees space
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 55.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        // Back to normal
+        assert!(engine
+            .evaluate(&snap(MetricKind::DiskUsage, 40.0))
+            .is_empty());
+    }
+
+    #[test]
+    fn disk_independent_of_all_other_metrics() {
+        let mut engine = AlertEngine::new(vec![
+            ThresholdRule {
+                metric: MetricKind::CpuUsage,
+                warning: 80.0,
+                critical: 95.0,
+            },
+            ThresholdRule {
+                metric: MetricKind::MemoryUsage,
+                warning: 85.0,
+                critical: 95.0,
+            },
+            ThresholdRule {
+                metric: MetricKind::DiskUsage,
+                warning: 80.0,
+                critical: 90.0,
+            },
+            ThresholdRule {
+                metric: MetricKind::Temperature,
+                warning: 70.0,
+                critical: 80.0,
+            },
+        ]);
+
+        // All four metrics alert independently
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 85.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::CpuUsage);
+
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 88.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::MemoryUsage);
+
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 82.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::DiskUsage);
+
+        let events = engine.evaluate(&snap(MetricKind::Temperature, 72.0));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metric, MetricKind::Temperature);
+
+        // Each recovers independently
+        let events = engine.evaluate(&snap(MetricKind::CpuUsage, 50.0));
+        assert_eq!(events[0].metric, MetricKind::CpuUsage);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 60.0));
+        assert_eq!(events[0].metric, MetricKind::MemoryUsage);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 55.0));
+        assert_eq!(events[0].metric, MetricKind::DiskUsage);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+
+        let events = engine.evaluate(&snap(MetricKind::Temperature, 40.0));
+        assert_eq!(events[0].metric, MetricKind::Temperature);
+        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+    }
 }
