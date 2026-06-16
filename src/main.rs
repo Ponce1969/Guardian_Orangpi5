@@ -74,9 +74,13 @@ fn main() -> Result<()> {
         let hostname = gethostname::gethostname()
             .into_string()
             .unwrap_or_else(|_| "unknown".to_string());
-        let discord = DiscordNotifier::new(webhook_url, hostname);
+        let cooldown = Duration::from_secs(config.notification.discord.min_interval_secs);
+        let discord = DiscordNotifier::new(webhook_url, hostname, cooldown);
         notifiers.push(Box::new(discord));
-        info!("Discord notifier enabled");
+        info!(
+            cooldown_secs = config.notification.discord.min_interval_secs,
+            "Discord notifier enabled"
+        );
     } else {
         info!("Discord notifier disabled");
     }
