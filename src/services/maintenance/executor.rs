@@ -11,10 +11,13 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
 
 /// Largest slice of a child's output kept in memory.
 ///
@@ -191,6 +194,186 @@ pub fn tail_chars(text: &str, max_chars: usize) -> &str {
         .nth(total - max_chars)
         .map(|(index, _)| &text[index..])
         .unwrap_or(text)
+}
+
+/// Keep at most `max_bytes` bytes from the end of `buffer`, as lossy text.
+///
+/// Two bounds apply for two reasons: the byte window keeps memory bounded while
+/// streaming, and the character trim keeps the result from starting on half a
+/// code point. Invalid UTF-8 becomes a replacement character rather than an
+/// error, because a log line that cannot be decoded is still worth reporting.
+pub fn bounded_text(buffer: &[u8], max_bytes: usize) -> String {
+    let start = buffer.len().saturating_sub(max_bytes);
+    let lossy = String::from_utf8_lossy(&buffer[start..]);
+
+    // Starting the window inside a multi-byte sequence leaves a replacement
+    // character at the front. It is an artefact of where reading began, not part
+    // of the log, so it is dropped rather than shown to the operator.
+    let trimmed = lossy.trim_start_matches('\u{FFFD}');
+
+    tail_chars(trimmed, max_bytes).to_string()
+}
+
+/// Read a child pipe to its end, keeping only the tail.
+///
+/// The buffer is trimmed while streaming so a task that emits megabytes cannot
+/// grow it without limit; the window is twice the budget so the tail is always
+/// complete once reading stops.
+async fn read_bounded<R>(reader: Option<R>, max_bytes: usize) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return String::new();
+    };
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+
+                if buffer.len() > max_bytes.saturating_mul(2) {
+                    let excess = buffer.len() - max_bytes;
+                    buffer.drain(..excess);
+                }
+            }
+            // A pipe that cannot be read any further ends the capture; the
+            // process outcome is what the caller acts on.
+            Err(_) => break,
+        }
+    }
+
+    bounded_text(&buffer, max_bytes)
+}
+
+/// Signal an entire process group.
+///
+/// A negative pid means "the group led by this pid", which is exactly the group
+/// `process_group(0)` established for the child. Signalling the child alone
+/// would leave anything it forked running.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: libc::c_int) {
+    // SAFETY: `kill(2)` has no memory-safety preconditions. The call is ignored
+    // on failure because the process may already be gone, which is not an error
+    // here: the caller reaps it next.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), signal);
+    }
+}
+
+/// Stop a child that overran its deadline, escalating from polite to forced.
+///
+/// Returns nothing: a timed-out run reports `exit_code: None`, because the code
+/// of a process that was killed is not a result the operator can use.
+async fn terminate(child: &mut Child, pid: Option<u32>, grace: Duration) {
+    #[cfg(unix)]
+    {
+        let Some(pid) = pid else {
+            let _ = child.kill().await;
+            return;
+        };
+
+        signal_group(pid, libc::SIGTERM);
+
+        if tokio::time::timeout(grace, child.wait()).await.is_ok() {
+            return;
+        }
+
+        // The grace window elapsed without an exit: take the group down.
+        signal_group(pid, libc::SIGKILL);
+        let _ = child.wait().await;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // No process group to signal. `kill` plus `kill_on_drop` is the whole
+        // story here, and the spec records it as a documented limitation rather
+        // than pretending the platforms are equivalent.
+        let _ = (pid, grace);
+        let _ = child.kill().await;
+    }
+}
+
+/// The production [`Executor`]: real processes, real deadlines, real signals.
+///
+/// No test constructs this type. The suite is written against [`Executor`] with a
+/// script, so nothing below is exercised by `cargo test`; the escalation is
+/// verified once, by hand, against a real orphan-prone command.
+pub struct ProcessExecutor;
+
+impl ProcessExecutor {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ProcessExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Executor for ProcessExecutor {
+    async fn run(&self, request: &ExecutionRequest) -> Result<ExecutionOutput, ExecutionError> {
+        let mut command = Command::new(request.program());
+
+        command
+            .args(request.args())
+            .envs(request.env().iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        // The child leads its own process group, so one signal reaches everything
+        // it forks instead of only the direct child.
+        #[cfg(unix)]
+        command.process_group(0);
+
+        if let Some(cwd) = request.cwd() {
+            command.current_dir(cwd);
+        }
+
+        let mut child = command.spawn().map_err(|error| ExecutionError::Spawn {
+            program: request.program().to_string(),
+            reason: error.to_string(),
+        })?;
+
+        let pid = child.id();
+
+        let stdout_task = tokio::spawn(read_bounded(child.stdout.take(), MAX_CAPTURE_BYTES));
+        let stderr_task = tokio::spawn(read_bounded(child.stderr.take(), MAX_CAPTURE_BYTES));
+
+        let (exit_code, timed_out) =
+            match tokio::time::timeout(request.timeout(), child.wait()).await {
+                Ok(Ok(status)) => (status.code(), false),
+                Ok(Err(error)) => {
+                    return Err(ExecutionError::Collect {
+                        reason: error.to_string(),
+                    })
+                }
+                Err(_) => {
+                    terminate(&mut child, pid, request.grace()).await;
+                    (None, true)
+                }
+            };
+
+        // Killing the group closes every pipe, so these finish promptly.
+        let stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
+
+        Ok(ExecutionOutput {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -378,5 +561,50 @@ mod tests {
         assert!(outcome.timed_out);
         assert_eq!(outcome.exit_code, None);
         assert!(matches!(error, Err(ExecutionError::Spawn { .. })));
+    }
+
+    // === bounded_text ===
+
+    #[test]
+    fn bounded_text_keeps_short_input_intact() {
+        assert_eq!(
+            bounded_text(b"docker: prune complete", MAX_CAPTURE_BYTES),
+            "docker: prune complete"
+        );
+    }
+
+    #[test]
+    fn bounded_text_keeps_only_the_tail() {
+        assert_eq!(bounded_text(b"abcdefghij", 3), "hij");
+    }
+
+    #[test]
+    fn bounded_text_of_empty_input_is_empty() {
+        assert_eq!(bounded_text(b"", 10), "");
+    }
+
+    /// The byte window can land inside a multi-byte sequence. The result must
+    /// not begin with half a character, which would render as a replacement
+    /// glyph in the notification.
+    #[test]
+    fn bounded_text_does_not_leave_a_broken_character() {
+        let text = "ééééé";
+
+        let bounded = bounded_text(text.as_bytes(), 5);
+
+        assert!(
+            !bounded.contains('\u{FFFD}'),
+            "expected no replacement character, got {bounded}"
+        );
+        assert!(text.ends_with(&bounded));
+    }
+
+    /// Bytes that cannot be decoded are dropped from the front rather than
+    /// poisoning the whole line.
+    #[test]
+    fn bounded_text_discards_undecodable_leading_bytes() {
+        let buffer = [0xFF_u8, 0xFE, b'a', b'b'];
+
+        assert_eq!(bounded_text(&buffer, 100), "ab");
     }
 }
