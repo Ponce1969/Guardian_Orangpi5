@@ -32,6 +32,9 @@ pub struct GuardianConfig {
     pub daemon: DaemonConfig,
     pub thresholds: ThresholdsConfig,
     pub notification: NotificationConfig,
+    /// Optional PostgreSQL health probe. An absent section means disabled.
+    #[serde(default)]
+    pub postgres: PostgresConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +83,19 @@ fn default_docker_disk_critical() -> f64 {
     80.0
 }
 
+/// Default warning for failed PostgreSQL probes.
+///
+/// Two of three probes failing means the database is mostly unreachable, while
+/// a single failure is a transient the retry already absorbed.
+fn default_postgres_failures_warning() -> f64 {
+    2.0
+}
+
+/// Default critical for failed PostgreSQL probes: every probe failed.
+fn default_postgres_failures_critical() -> f64 {
+    3.0
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ThresholdsConfig {
     /// CPU usage percent that triggers a warning alert.
@@ -123,6 +139,107 @@ pub struct ThresholdsConfig {
     /// Docker disk usage (GB) that triggers a critical alert.
     #[serde(default = "default_docker_disk_critical")]
     pub docker_disk_critical: f64,
+    /// Failed PostgreSQL probes that trigger a warning alert.
+    ///
+    /// One failed probe out of three is absorbed on purpose: the database still
+    /// answered, so it is degraded but alive.
+    #[serde(default = "default_postgres_failures_warning")]
+    pub postgres_failures_warning: f64,
+    /// Failed PostgreSQL probes that trigger a critical alert.
+    #[serde(default = "default_postgres_failures_critical")]
+    pub postgres_failures_critical: f64,
+}
+
+fn default_postgres_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_postgres_port() -> u16 {
+    5432
+}
+
+fn default_postgres_user() -> String {
+    "guardian".to_string()
+}
+
+fn default_postgres_database() -> String {
+    "postgres".to_string()
+}
+
+fn default_postgres_password_env() -> String {
+    "GUARDIAN_PG_PASSWORD".to_string()
+}
+
+/// Default connect timeout for a single probe, in seconds.
+///
+/// Three failed probes are attempted per cycle, so this bounds the worst case
+/// at three times this value and keeps it under the default poll interval.
+fn default_postgres_connect_timeout_secs() -> u64 {
+    3
+}
+
+/// PostgreSQL health-check configuration.
+///
+/// The password is never part of this struct's serialized form: it carries the
+/// *name* of the environment variable that holds it, exactly like the Discord
+/// webhook. A configuration file is therefore safe to commit.
+#[derive(Debug, Deserialize)]
+pub struct PostgresConfig {
+    /// Whether the PostgreSQL probe runs at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host of the server or container.
+    #[serde(default = "default_postgres_host")]
+    pub host: String,
+    /// TCP port.
+    #[serde(default = "default_postgres_port")]
+    pub port: u16,
+    /// Role used for the probe. It only needs permission to connect.
+    #[serde(default = "default_postgres_user")]
+    pub user: String,
+    /// Database the probe connects to.
+    #[serde(default = "default_postgres_database")]
+    pub database: String,
+    /// Name of the environment variable holding the password.
+    #[serde(default = "default_postgres_password_env")]
+    pub password_env: String,
+    /// Seconds to wait for a single connection attempt.
+    #[serde(default = "default_postgres_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Resolved password, populated from the environment during config load.
+    #[serde(skip)]
+    resolved_password: Option<String>,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_postgres_host(),
+            port: default_postgres_port(),
+            user: default_postgres_user(),
+            database: default_postgres_database(),
+            password_env: default_postgres_password_env(),
+            connect_timeout_secs: default_postgres_connect_timeout_secs(),
+            resolved_password: None,
+        }
+    }
+}
+
+impl PostgresConfig {
+    /// Returns the resolved password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MissingEnv`] when the password was never
+    /// resolved. [`load`] resolves it whenever `enabled` is set.
+    pub fn password(&self) -> Result<&str, ConfigError> {
+        self.resolved_password
+            .as_deref()
+            .ok_or_else(|| ConfigError::MissingEnv {
+                var: self.password_env.clone(),
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +310,17 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
         config.notification.discord.resolved_webhook_url = Some(url);
     }
 
+    // The password follows the same contract as the webhook: the file carries
+    // the variable name, never the value, and a missing variable is an
+    // explicit load error rather than a runtime surprise.
+    if config.postgres.enabled {
+        let env_var = &config.postgres.password_env;
+        let password = env::var(env_var).map_err(|_| ConfigError::MissingEnv {
+            var: env_var.clone(),
+        })?;
+        config.postgres.resolved_password = Some(password);
+    }
+
     Ok(config)
 }
 
@@ -247,6 +375,80 @@ notification:
     /// Network thresholds arrived after this fixture was written, so parsing it
     /// unchanged is the backwards compatibility proof for every deployed
     /// configuration that predates network monitoring.
+    fn load_from_temp(yaml: &str) -> Result<GuardianConfig, ConfigError> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "guardian-config-{}-{}.yaml",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, yaml).expect("temp config written");
+
+        let result = load(path.to_str().expect("utf-8 temp path"));
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    /// A configuration written before PostgreSQL existed must keep loading, and
+    /// the probe must stay off instead of silently enabling itself.
+    #[test]
+    fn postgres_is_disabled_when_the_section_is_absent() {
+        let config: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("legacy parses");
+
+        assert!(!config.postgres.enabled);
+        assert!(
+            config.postgres.password().is_err(),
+            "a disabled probe must not hold a password"
+        );
+    }
+
+    /// The file carries the variable name, never the value, so parsing a
+    /// configuration cannot produce a secret.
+    #[test]
+    fn postgres_yaml_cannot_carry_a_password() {
+        let yaml = format!(
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  password_env: GUARDIAN_UNUSED_PG_VAR\n"
+        );
+
+        let config: GuardianConfig = serde_yaml::from_str(&yaml).expect("parses");
+
+        assert!(config.postgres.enabled);
+        assert!(
+            config.postgres.password().is_err(),
+            "reading YAML alone must never resolve a secret"
+        );
+    }
+
+    #[test]
+    fn load_resolves_the_postgres_password_from_the_environment() {
+        const VAR: &str = "GUARDIAN_TEST_PG_PASSWORD_LOAD";
+        std::env::set_var(VAR, "s3cret");
+
+        let yaml = format!("{LEGACY_YAML}\npostgres:\n  enabled: true\n  password_env: {VAR}\n");
+        let config = load_from_temp(&yaml).expect("configuration loads");
+
+        assert_eq!(config.postgres.password().ok(), Some("s3cret"));
+
+        std::env::remove_var(VAR);
+    }
+
+    #[test]
+    fn load_fails_when_the_postgres_password_is_missing() {
+        let yaml = format!(
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  password_env: GUARDIAN_SURELY_UNSET_PG_VAR\n"
+        );
+
+        let result = load_from_temp(&yaml);
+
+        assert!(
+            matches!(result, Err(ConfigError::MissingEnv { .. })),
+            "a missing password must fail the load, not the first probe"
+        );
+    }
+
     #[test]
     fn network_thresholds_default_when_absent() {
         let config: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("legacy YAML parses");

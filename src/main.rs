@@ -11,6 +11,7 @@ use guardian_rs::collectors::disk::DiskCollector;
 use guardian_rs::collectors::docker::DockerCollector;
 use guardian_rs::collectors::memory::MemoryCollector;
 use guardian_rs::collectors::network::NetworkCollector;
+use guardian_rs::collectors::postgres::PostgresCollector;
 use guardian_rs::collectors::temperature::TemperatureCollector;
 use guardian_rs::collectors::Collector;
 use guardian_rs::config;
@@ -54,7 +55,7 @@ fn main() -> Result<()> {
     let temperature_collector = TemperatureCollector::new();
     let network_collector = NetworkCollector::new();
     let docker_collector = DockerCollector::new();
-    let collectors: Vec<Box<dyn Collector>> = vec![
+    let mut collectors: Vec<Box<dyn Collector>> = vec![
         Box::new(cpu_collector),
         Box::new(memory_collector),
         Box::new(disk_collector),
@@ -62,6 +63,24 @@ fn main() -> Result<()> {
         Box::new(network_collector),
         Box::new(docker_collector),
     ];
+
+    // The PostgreSQL probe is optional: it needs credentials the other
+    // collectors do not, so a configuration without them must not stop the
+    // rest of the monitoring.
+    if config.postgres.enabled {
+        match PostgresCollector::from_config(&config.postgres) {
+            Ok(collector) => {
+                info!(host = %config.postgres.host, database = %config.postgres.database, "PostgreSQL probe enabled");
+                collectors.push(Box::new(collector));
+            }
+            Err(reason) => error!(
+                reason = %reason,
+                "PostgreSQL probe disabled: configuration incomplete"
+            ),
+        }
+    } else {
+        info!("PostgreSQL probe disabled");
+    }
     info!(count = collectors.len(), "Collectors initialized");
 
     // === Alert Engine ===

@@ -24,8 +24,22 @@ thresholds:
   # Total Docker disk usage in GB (images + containers + volumes + build cache).
   docker_disk_warning: 40
   docker_disk_critical: 80
+  # Failed PostgreSQL probes out of 3. One failure is absorbed as transient.
+  postgres_failures_warning: 2
+  postgres_failures_critical: 3
 
 notification:
   discord:
     enabled: true
     webhook_url_env: DISCORD_WEBHOOK_URL
+
+# PostgreSQL health probe. The password is NEVER written here: this file only
+# names the environment variable that holds it, so it is safe to commit.
+postgres:
+  enabled: false
+  host: 127.0.0.1
+  port: 5432
+  database: postgres
+  user: guardian
+  password_env: GUARDIAN_PG_PASSWORD
+  connect_timeout_secs: 3

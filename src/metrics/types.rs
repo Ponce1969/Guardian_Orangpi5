@@ -14,6 +14,7 @@ pub enum MetricKind {
     NetworkThroughput,
     DockerUnhealthyContainers,
     DockerDiskUsed,
+    PostgresProbeFailures,
 }
 
 impl std::fmt::Display for MetricKind {
@@ -26,6 +27,7 @@ impl std::fmt::Display for MetricKind {
             Self::NetworkThroughput => write!(f, "network_throughput"),
             Self::DockerUnhealthyContainers => write!(f, "docker_unhealthy_containers"),
             Self::DockerDiskUsed => write!(f, "docker_disk_used"),
+            Self::PostgresProbeFailures => write!(f, "postgres_probe_failures"),
         }
     }
 }
@@ -46,6 +48,7 @@ impl MetricKind {
             Self::NetworkThroughput => "MB/s",
             Self::DockerUnhealthyContainers => "containers",
             Self::DockerDiskUsed => "GB",
+            Self::PostgresProbeFailures => "failures",
         }
     }
 
@@ -61,6 +64,7 @@ impl MetricKind {
             Self::NetworkThroughput => "Network Throughput",
             Self::DockerUnhealthyContainers => "Docker Unhealthy Containers",
             Self::DockerDiskUsed => "Docker Disk Used",
+            Self::PostgresProbeFailures => "PostgreSQL Probe Failures",
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod disk;
 pub mod docker;
 pub mod memory;
 pub mod network;
+pub mod postgres;
 pub mod temperature;
 
 pub use cpu::CpuCollector;
@@ -10,6 +11,7 @@ pub use disk::DiskCollector;
 pub use docker::DockerCollector;
 pub use memory::MemoryCollector;
 pub use network::NetworkCollector;
+pub use postgres::PostgresCollector;
 pub use temperature::TemperatureCollector;
 
 use async_trait::async_trait;

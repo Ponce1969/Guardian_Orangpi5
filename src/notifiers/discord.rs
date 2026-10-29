@@ -57,6 +57,7 @@ impl MetricKind {
             Self::NetworkThroughput => "🌐",
             Self::DockerUnhealthyContainers => "🐳",
             Self::DockerDiskUsed => "📦",
+            Self::PostgresProbeFailures => "🐘",
         }
     }
 }

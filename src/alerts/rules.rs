@@ -52,6 +52,11 @@ pub fn rules_from_config(config: &crate::config::ThresholdsConfig) -> Vec<Thresh
             warning: config.docker_disk_warning,
             critical: config.docker_disk_critical,
         },
+        ThresholdRule {
+            metric: MetricKind::PostgresProbeFailures,
+            warning: config.postgres_failures_warning,
+            critical: config.postgres_failures_critical,
+        },
     ]
 }
 
