@@ -9,6 +9,7 @@
 
 pub mod executor;
 pub mod outcome;
+pub mod schedule;
 
 pub use executor::{
     tail_chars, ExecutionError, ExecutionOutput, ExecutionRequest, Executor, MAX_CAPTURE_BYTES,
@@ -17,3 +18,4 @@ pub use executor::{
 pub use outcome::{
     classify_execution, should_notify, summarize, MaintenanceOutcome, MaintenanceStatus,
 };
+pub use schedule::{daily_is_due, interval_is_due, DailyTime, DueReason};

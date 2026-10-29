@@ -144,6 +144,34 @@ These cover every task the SPEC names: a weekly prune, a nightly backup and a
 daily rotation. Evaluation runs on the orchestrator's existing tick, using
 `tokio::time`; no additional runtime is introduced.
 
+### Rule: two clocks, deliberately
+
+An interval is measured on a **monotonic** clock, so an NTP correction or a
+daylight-saving change cannot move when the next prune is due. A daily time is
+measured on the **local wall clock**, because `03:30` names half past three in
+the morning, not an elapsed instant.
+
+Collapsing both onto one clock produces the classic failure where a nightly job
+fires twice in October and not at all in March.
+
+Due-ness is measured against *the most recent moment the schedule named*, not
+against "the previous run plus an interval". That single choice makes catch-up
+safe with no special cases: a host that was off for three days produces one run,
+because after that run the last run is later than the most recent moment. The
+same property settles both daylight-saving cases without any code that mentions
+daylight saving.
+
+### Rule: at most one overdue task per tick
+
+A reboot can leave several tasks overdue at once. Running them together puts a
+`pg_dump`, a `docker prune` and anything else into the same window, competing for
+I/O on the same storage — a burst that no individual task caused.
+
+The scheduler therefore runs **at most one due task per tick**. With the default
+poll interval that spreads three overdue tasks over ninety seconds. The
+`DueReason` reported for each run makes the spread visible instead of looking
+like a mysterious delay.
+
 ### Rejected alternatives
 
 - **`tokio-cron-scheduler`.** It brings a cron parser plus its own task
