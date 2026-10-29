@@ -81,12 +81,20 @@ pub struct MaintenanceOutcome {
 | anything | `Failed` or `TimedOut` | notify |
 | `Failed` / `TimedOut` | `Failed` / `TimedOut` | **notify again** |
 | `Failed` / `TimedOut` / `Skipped` | `Success` | notify once (recovery) |
+| anything (other than `Skipped`) | `Skipped` | notify once, on entering the skip |
+| `Skipped` | `Skipped` | **silent** |
 
 Rationale: the noise to suppress is a stable *success* — a backup that worked
 again for the two-hundredth time. Failures are never suppressed, because
 "notify only on change" would let a backup fail once and then stay broken and
 silent for a week. The rule is deliberately asymmetric: silence is only ever
 applied in the safe direction.
+
+`Skipped` follows the same asymmetry. Entering a skip is a state change worth
+knowing about: it means maintenance stopped happening, and the reason is a
+precondition the operator can fix. Staying skipped is a stable state, so it is
+silent — otherwise a host that legitimately has no Docker would be told so every
+cycle, forever.
 
 ### Bounded detail
 
