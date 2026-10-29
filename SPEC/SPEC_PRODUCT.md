@@ -115,11 +115,17 @@ Future transports may be added later.
 
 ## Maintenance
 
-GuardianRS may execute operational maintenance tasks:
+GuardianRS executes only constructive, data-protecting maintenance:
 
-- Docker cleanup
-- PostgreSQL backups
-- log rotation
+- PostgreSQL logical backups
+
+**Destructive mutation is human.** GuardianRS never prunes Docker images,
+containers, volumes or build cache, and never deletes files it did not create as
+part of its own retention window. It reports space usage and names the manual
+command instead.
+
+Log rotation and Docker cleanup were both considered and dropped; the reasoning
+lives in [SPEC_MAINTENANCE.md](SPEC_MAINTENANCE.md).
 
 Maintenance must remain observable and auditable.
 

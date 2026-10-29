@@ -2,22 +2,36 @@
 
 ## Overview
 
-GuardianRS may execute operational maintenance tasks on the hosts it monitors:
-Docker cleanup, PostgreSQL backups and log rotation. This document specifies how
-those tasks are scheduled, executed, sandboxed and reported.
+GuardianRS executes operational maintenance on the hosts it monitors, and today
+that means one thing: PostgreSQL logical backups. This document specifies how a
+task is scheduled, executed, sandboxed and reported.
 
 Maintenance is the only part of GuardianRS that *changes* a host instead of
-observing it. Every rule below exists to keep that power bounded, visible, and
-safe to get wrong.
+observing it, so every rule below exists to keep that power bounded, visible and
+safe to get wrong. Docker cleanup and log rotation were both considered and are
+deliberately out; the governing rule below explains why.
 
 Derived from `SPEC_PRODUCT.md` (Maintenance), `SPEC_ARCHITECTURE.md`
 (Maintenance Flow) and `SPEC_ENGINEERING.md` (Maintenance Rules, Security).
+
+## Governing rule
+
+**Observability and auditing are autonomous. Destructive mutation is human.**
+
+Nothing in this daemon deletes containers, images, build cache or volumes on a
+schedule, and nothing deletes a file it did not itself create. On a host running
+several databases and projects under active development, one wrong prune costs
+more than every gigabyte it could ever reclaim; the benefit is bounded and the
+loss is not.
+
+GuardianRS therefore reports the space and names the manual command, and the
+operator decides. Adding a destructive task later is not an implementation
+detail — it is a change to this document, with its own justification.
 
 ## Scope
 
 In scope:
 
-- Docker cleanup: unused images, stopped containers, dangling volumes, build cache
 - PostgreSQL logical backups
 
 Deferred: rotation of log files. GuardianRS logs through journald, which already
@@ -27,10 +41,20 @@ explicit decision about *which* files and by what criterion.
 
 Out of scope, and staying out (see the `SPEC_PRODUCT.md` non-goals):
 
+- **destructive mutation of any kind**: pruning Docker images, containers,
+  volumes or build cache; deleting files other than the backups this service
+  created for its own retention window
 - provisioning, deploying, upgrading or restarting services
 - arbitrary scripting or a shell command supplied by configuration
 - self-healing on arbitrary triggers
 - anything requiring root
+
+### What replaces Docker cleanup
+
+`DockerDiskUsed` from the Docker collector already reports what the daemon holds,
+split by images, containers, volumes and build cache. When it crosses a threshold
+the notification states the figure and suggests the manual command. The
+information is kept and the risk is dropped.
 
 ---
 
@@ -125,13 +149,8 @@ maintenance:
     - name: postgres_backup
       kind: postgres_backup
       schedule: { daily_at: "03:30" }
-      timeout_secs: 600
-      grace_secs: 5
-    - name: docker_prune
-      kind: docker_prune
-      schedule: { every_hours: 168 }
-      timeout_secs: 120
-      grace_secs: 5
+      timeout_secs: 1800
+      grace_secs: 30
 ```
 
 Two schedule forms are supported:
@@ -140,9 +159,10 @@ Two schedule forms are supported:
 - `daily_at: "HH:MM"` — once per day at local time, catching up at the next
   tick if the daemon was down at that moment
 
-These cover every task the SPEC names: a weekly prune, a nightly backup and a
-daily rotation. Evaluation runs on the orchestrator's existing tick, using
-`tokio::time`; no additional runtime is introduced.
+These cover every task the SPEC names — today a single nightly backup — and they
+exist so that a weekly or a daily task needs no new code. Evaluation runs on the
+orchestrator's existing tick, using `tokio::time`; no additional runtime is
+introduced.
 
 ### Rule: two clocks, deliberately
 
@@ -164,8 +184,8 @@ daylight saving.
 ### Rule: at most one overdue task per tick
 
 A reboot can leave several tasks overdue at once. Running them together puts a
-`pg_dump`, a `docker prune` and anything else into the same window, competing for
-I/O on the same storage — a burst that no individual task caused.
+`pg_dump` and every other task into the same window, competing for I/O on the
+same storage — a burst that no individual task caused.
 
 The scheduler therefore runs **at most one due task per tick**. With the default
 poll interval that spreads three overdue tasks over ninety seconds. The
@@ -234,17 +254,19 @@ typed parameters:
 
 ```rust
 pub enum MaintenanceKind {
-    DockerPrune,
     PostgresBackup,
-    LogRotate,
 }
 ```
+
+One variant is the point, not an omission. The closed set is the guarantee: adding
+a second kind — and above all a destructive one — is a deliberate change to this
+document, reviewed as such, rather than a line of configuration someone appends.
 
 There is no `command:` field, and there never will be. Every execution is argv,
 never a shell and never a string that reaches one:
 
 ```rust
-Command::new("docker").args(["system", "prune", "-af"])
+Command::new("pg_dump").args(["--no-password", "-Fc", "-f", destination])
 ```
 
 No `sh -c`, no concatenation of configuration values into a command line. This
@@ -263,9 +285,7 @@ needs:
 
 | Kind | Requires |
 | --- | --- |
-| `DockerPrune` | access to the Docker socket (`docker` group) |
-| `PostgresBackup` | a PostgreSQL role with `CONNECT` and `SELECT` only |
-| `LogRotate` | write access to the specific log directory |
+| `PostgresBackup` | a PostgreSQL role with `CONNECT` and `SELECT` only, plus write access to the backup destination |
 
 ### Required unit changes
 
@@ -333,11 +353,11 @@ confirmed is how a working backup gets deleted by a broken one.
 | exit code 0 | `Success` | last stderr lines (often empty) |
 | exit code ≠ 0 | `Failed` | exit code + redacted stderr tail |
 | deadline exceeded | `TimedOut` | redacted stderr collected so far |
-| preconditions unmet (no socket, no credentials) | `Skipped` | the missing precondition |
+| preconditions unmet (no credentials, missing binary) | `Skipped` | the missing precondition |
 | binary not found / spawn error | `Failed` | the spawn error |
 
-A missing Docker socket and a missing `pg_dump` are `Skipped`, not `Failed` on
-loop: a host that legitimately has no Docker must not spend every cycle failing.
+A missing `pg_dump` is `Skipped`, not `Failed` on loop: a host that legitimately
+has no PostgreSQL client must not spend every cycle failing.
 
 ---
 
