@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::oneshot;
-use tracing::info;
+use tracing::{error, info};
 
 use guardian_rs::alerts::engine::AlertEngine;
 use guardian_rs::alerts::rules::rules_from_config;
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     let mut notifiers: Vec<Box<dyn Notifier>> = vec![Box::new(LogNotifier::new())];
 
     if config.notification.discord.enabled {
-        let webhook_url = config.notification.discord.webhook_url().to_string();
+        let webhook_url = config.notification.discord.webhook_url()?.to_string();
         let hostname = gethostname::gethostname()
             .into_string()
             .unwrap_or_else(|_| "unknown".to_string());
@@ -111,28 +111,53 @@ fn main() -> Result<()> {
         {
             use tokio::signal::unix::{signal, SignalKind};
             tokio::spawn(async move {
-                let mut sigterm =
-                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-                tokio::select! {
-                    _ = sigterm.recv() => {
-                        info!("SIGTERM received, initiating shutdown");
+                match signal(SignalKind::terminate()) {
+                    Ok(mut sigterm) => {
+                        tokio::select! {
+                            _ = sigterm.recv() => {
+                                info!("SIGTERM received, initiating shutdown");
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                info!("Ctrl+C received, initiating shutdown");
+                            }
+                        }
+                        let _ = shutdown_tx.send(());
                     }
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Ctrl+C received, initiating shutdown");
+                    Err(error) => {
+                        // A failure inside one task must not terminate the daemon,
+                        // and a silent failure is forbidden (SPEC_ENGINEERING).
+                        error!(
+                            %error,
+                            "Failed to register SIGTERM handler; falling back to Ctrl+C only"
+                        );
+                        match tokio::signal::ctrl_c().await {
+                            Ok(()) => {
+                                info!("Ctrl+C received, initiating shutdown");
+                                let _ = shutdown_tx.send(());
+                            }
+                            Err(error) => error!(
+                                %error,
+                                "Failed to listen for Ctrl+C; graceful shutdown is unavailable"
+                            ),
+                        }
                     }
                 }
-                let _ = shutdown_tx.send(());
             });
         }
 
         #[cfg(not(unix))]
         {
             tokio::spawn(async move {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to listen for ctrl+c");
-                info!("Ctrl+C received, initiating shutdown");
-                let _ = shutdown_tx.send(());
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        info!("Ctrl+C received, initiating shutdown");
+                        let _ = shutdown_tx.send(());
+                    }
+                    Err(error) => error!(
+                        %error,
+                        "Failed to listen for Ctrl+C; graceful shutdown is unavailable"
+                    ),
+                }
             });
         }
 

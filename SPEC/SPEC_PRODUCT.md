@@ -40,6 +40,7 @@ The system should help operators quickly detect:
 - PostgreSQL failures
 - memory pressure
 - infrastructure degradation
+- repeated authentication failures
 
 ---
 
@@ -71,6 +72,33 @@ GuardianRS monitors:
 - Docker containers
 - PostgreSQL health
 - Docker disk usage
+- authentication events
+
+## Security Auditing
+
+GuardianRS may observe authentication and system events to detect intrusion
+attempts and raise alerts about them.
+
+The scope is deliberately narrow: **detection and alerting only**.
+
+GuardianRS must detect and report:
+
+- repeated authentication failures (sshd, sudo, local logins, container shells)
+- logins from unexpected sources or at unexpected hours
+- new listening sockets that were not present before
+- loss of health of the tunnel or the private network layer
+
+GuardianRS must NOT:
+
+- block, ban, rate-limit or filter source IP addresses
+- modify firewall rules
+- attempt remediation of a suspected intrusion
+
+Rationale: hosts running GuardianRS are not publicly exposed. Inbound access
+arrives through an outbound tunnel and a private mesh network, where access is
+decided by identity and policy rather than by source address. Blocking an
+address in that topology is unreliable and risks locking out the operator.
+An alert plus an audit trail is the correct response; a ban is not.
 
 ---
 
@@ -118,7 +146,8 @@ GuardianRS is NOT:
 
 - Kubernetes monitoring
 - enterprise observability platform
-- SIEM
+- SIEM (cross-host log aggregation, correlation and search)
+- IP blocking or fail2ban-style banning
 - cloud-native monitoring suite
 - infrastructure provisioning tool
 - container orchestrator

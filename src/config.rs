@@ -18,6 +18,9 @@ pub enum ConfigError {
 
     #[error("Missing required environment variable: {var}")]
     MissingEnv { var: String },
+
+    #[error("Webhook URL was not resolved during config load")]
+    WebhookNotResolved,
 }
 
 /// Top-level GuardianRS configuration.
@@ -135,15 +138,15 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
 impl DiscordConfig {
     /// Returns the resolved webhook URL.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called before `load()` resolves the URL from the environment.
-    /// In practice this cannot happen because `load()` sets the URL before
-    /// any notifier is constructed.
-    pub fn webhook_url(&self) -> &str {
+    /// Returns [`ConfigError::WebhookNotResolved`] when the URL was never
+    /// resolved. [`load`] resolves it whenever `enabled` is set, so this case
+    /// is only reachable through a hand-built configuration.
+    pub fn webhook_url(&self) -> Result<&str, ConfigError> {
         self.resolved_webhook_url
             .as_deref()
-            .expect("webhook URL must be resolved during config load")
+            .ok_or(ConfigError::WebhookNotResolved)
     }
 }
 
@@ -175,5 +178,25 @@ notification:
         assert_eq!(config.daemon.poll_interval_secs, 30);
         assert_eq!(config.thresholds.cpu_warning, 80.0);
         assert!(!config.notification.discord.enabled);
+    }
+
+    /// An unresolved webhook URL must be reported as a recoverable condition,
+    /// never as a panic: AGENTS.md and SPEC_ENGINEERING forbid `unwrap()` and
+    /// `expect()` in production code.
+    #[test]
+    fn webhook_url_unresolved_is_recoverable() {
+        let config = DiscordConfig {
+            enabled: false,
+            webhook_url_env: "DISCORD_WEBHOOK_URL".to_string(),
+            min_interval_secs: 300,
+            resolved_webhook_url: None,
+        };
+
+        let resolved = config.webhook_url();
+
+        assert!(
+            matches!(resolved, Err(ConfigError::WebhookNotResolved)),
+            "webhook_url() must report the unresolved URL instead of panicking, got {resolved:?}"
+        );
     }
 }

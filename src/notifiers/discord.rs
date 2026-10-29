@@ -126,7 +126,12 @@ impl DiscordNotifier {
             return true;
         }
 
-        let last_sent = self.last_sent.lock().expect("cooldown lock not poisoned");
+        // A poisoned cooldown map carries no invariant worth panicking for:
+        // recovering may send one extra notification, which is the safe direction.
+        let last_sent = self
+            .last_sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match last_sent.get(&event.metric) {
             Some(last_time) => {
                 let elapsed = Utc::now() - *last_time;
@@ -139,7 +144,10 @@ impl DiscordNotifier {
 
     /// Record that an alert was sent for a metric, updating cooldown state.
     fn record_sent(&self, metric: MetricKind) {
-        let mut last_sent = self.last_sent.lock().expect("cooldown lock not poisoned");
+        let mut last_sent = self
+            .last_sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         last_sent.insert(metric, Utc::now());
     }
 
