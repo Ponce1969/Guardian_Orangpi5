@@ -13,6 +13,10 @@ thresholds:
   disk_critical: 90
   temp_warning: 70
   temp_critical: 80
+  # Network throughput in MB/s, aggregated over physical interfaces only.
+  # A 1 GbE link saturates near 119 MB/s, so these fire before saturation.
+  network_warning: 80
+  network_critical: 110
 
 notification:
   discord:

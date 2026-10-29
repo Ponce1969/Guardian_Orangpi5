@@ -40,6 +40,20 @@ pub struct DaemonConfig {
     pub poll_interval_secs: u64,
 }
 
+/// Default network warning threshold in MB/s.
+///
+/// Sized for a saturated 1 GbE link (~119 MB/s theoretical), so the warning
+/// fires before the link is fully consumed. Override it in the configuration
+/// once real traffic is measured.
+fn default_network_warning() -> f64 {
+    80.0
+}
+
+/// Default network critical threshold in MB/s.
+fn default_network_critical() -> f64 {
+    110.0
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ThresholdsConfig {
     /// CPU usage percent that triggers a warning alert.
@@ -58,6 +72,15 @@ pub struct ThresholdsConfig {
     pub temp_warning: f64,
     /// SoC temperature (°C) that triggers a critical alert.
     pub temp_critical: f64,
+    /// Network throughput (MB/s) that triggers a warning alert.
+    ///
+    /// Defaulted so a configuration written before network monitoring existed
+    /// keeps loading unchanged.
+    #[serde(default = "default_network_warning")]
+    pub network_warning: f64,
+    /// Network throughput (MB/s) that triggers a critical alert.
+    #[serde(default = "default_network_critical")]
+    pub network_critical: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,9 +173,10 @@ impl DiscordConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_minimal_yaml() {
-        let yaml = r#"
+    /// A configuration written before network monitoring existed: it has no
+    /// `network_*` thresholds, which is exactly what makes it the backwards
+    /// compatibility fixture for deployed files.
+    const LEGACY_YAML: &str = r#"
 daemon:
   poll_interval_secs: 30
 thresholds:
@@ -169,10 +193,24 @@ notification:
     enabled: false
     webhook_url_env: DISCORD_WEBHOOK_URL
 "#;
-        let config: GuardianConfig = serde_yaml::from_str(yaml).expect("valid YAML");
+
+    #[test]
+    fn parse_minimal_yaml() {
+        let config: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("valid YAML");
         assert_eq!(config.daemon.poll_interval_secs, 30);
         assert_eq!(config.thresholds.cpu_warning, 80.0);
         assert!(!config.notification.discord.enabled);
+    }
+
+    /// Network thresholds arrived after this fixture was written, so parsing it
+    /// unchanged is the backwards compatibility proof for every deployed
+    /// configuration that predates network monitoring.
+    #[test]
+    fn network_thresholds_default_when_absent() {
+        let config: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("legacy YAML parses");
+
+        assert_eq!(config.thresholds.network_warning, 80.0);
+        assert_eq!(config.thresholds.network_critical, 110.0);
     }
 
     /// An unresolved webhook URL must be reported as a recoverable condition,

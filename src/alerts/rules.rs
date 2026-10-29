@@ -37,6 +37,11 @@ pub fn rules_from_config(config: &crate::config::ThresholdsConfig) -> Vec<Thresh
             warning: config.temp_warning,
             critical: config.temp_critical,
         },
+        ThresholdRule {
+            metric: MetricKind::NetworkThroughput,
+            warning: config.network_warning,
+            critical: config.network_critical,
+        },
     ]
 }
 

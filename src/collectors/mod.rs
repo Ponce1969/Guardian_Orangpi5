@@ -1,11 +1,13 @@
 pub mod cpu;
 pub mod disk;
 pub mod memory;
+pub mod network;
 pub mod temperature;
 
 pub use cpu::CpuCollector;
 pub use disk::DiskCollector;
 pub use memory::MemoryCollector;
+pub use network::NetworkCollector;
 pub use temperature::TemperatureCollector;
 
 use async_trait::async_trait;
