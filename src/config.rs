@@ -72,8 +72,6 @@ pub struct DiscordConfig {
     /// Name of the environment variable holding the webhook URL.
     /// The URL itself is never stored in YAML or code.
     pub webhook_url_env: String,
-    /// Minimum seconds between identical notification dispatches (dedup cooldown).
-    pub min_interval_secs: u64,
     /// Resolved webhook URL, populated from the environment during config load.
     /// Not deserialized from YAML — secrets never touch the config file.
     resolved_webhook_url: Option<String>,
@@ -88,14 +86,12 @@ impl<'de> Deserialize<'de> for DiscordConfig {
         struct Raw {
             enabled: bool,
             webhook_url_env: String,
-            min_interval_secs: u64,
         }
 
         let raw = Raw::deserialize(deserializer)?;
         Ok(DiscordConfig {
             enabled: raw.enabled,
             webhook_url_env: raw.webhook_url_env,
-            min_interval_secs: raw.min_interval_secs,
             resolved_webhook_url: None,
         })
     }
@@ -172,7 +168,6 @@ notification:
   discord:
     enabled: false
     webhook_url_env: DISCORD_WEBHOOK_URL
-    min_interval_secs: 300
 "#;
         let config: GuardianConfig = serde_yaml::from_str(yaml).expect("valid YAML");
         assert_eq!(config.daemon.poll_interval_secs, 30);
@@ -188,7 +183,6 @@ notification:
         let config = DiscordConfig {
             enabled: false,
             webhook_url_env: "DISCORD_WEBHOOK_URL".to_string(),
-            min_interval_secs: 300,
             resolved_webhook_url: None,
         };
 

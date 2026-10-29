@@ -18,4 +18,3 @@ notification:
   discord:
     enabled: true
     webhook_url_env: DISCORD_WEBHOOK_URL
-    min_interval_secs: 300

@@ -1,10 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Duration;
-
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::alerts::state::AlertSeverity;
 use crate::alerts::AlertEvent;
@@ -69,16 +64,12 @@ impl MetricKind {
 /// Constructs rich embeds with severity-based colors, clear titles,
 /// and compact operational fields for at-a-glance readability.
 ///
-/// # Cooldown
-///
-/// After sending an alert for a metric, subsequent alerts for the same
-/// metric are suppressed for `cooldown` duration. This prevents Discord
-/// spam when a metric oscillates around a threshold (flapping).
-///
-/// **Critical alerts always bypass cooldown** — they represent genuine
-/// emergencies that must be dispatched immediately.
-///
-/// The `LogNotifier` is not affected by cooldown; it always logs all events.
+/// Suppression is deliberately not this type's job. The Alert Engine emits an
+/// event only when a metric changes state, and that transition deduplication
+/// (see `AlertStateTracker`) is the single layer that prevents notification
+/// spam. A notifier that also suppressed would be mutating alert state, which
+/// the `Notifier` contract forbids, and it silently swallowed the `Recovered`
+/// event that closes an alert.
 ///
 /// # Ownership Rules
 ///
@@ -91,8 +82,6 @@ pub struct DiscordNotifier {
     webhook_url: String,
     hostname: String,
     client: reqwest::Client,
-    cooldown: Duration,
-    last_sent: Mutex<HashMap<MetricKind, DateTime<Utc>>>,
 }
 
 impl DiscordNotifier {
@@ -100,55 +89,12 @@ impl DiscordNotifier {
     ///
     /// `hostname` is included in alert embeds to identify which server
     /// generated the alert. Pass the machine's hostname.
-    /// `cooldown` is the minimum duration between notifications for
-    /// the same metric. Set to `Duration::ZERO` to disable cooldown.
-    pub fn new(webhook_url: String, hostname: String, cooldown: Duration) -> Self {
+    pub fn new(webhook_url: String, hostname: String) -> Self {
         Self {
             webhook_url,
             hostname,
             client: reqwest::Client::new(),
-            cooldown,
-            last_sent: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Check whether an alert event should be suppressed due to cooldown.
-    ///
-    /// Returns `true` if the event should be sent, `false` if suppressed.
-    /// Critical alerts always return `true` regardless of cooldown state.
-    fn should_send(&self, event: &AlertEvent) -> bool {
-        // Critical alerts always bypass cooldown
-        if event.severity == AlertSeverity::Critical {
-            return true;
-        }
-
-        if self.cooldown.is_zero() {
-            return true;
-        }
-
-        // A poisoned cooldown map carries no invariant worth panicking for:
-        // recovering may send one extra notification, which is the safe direction.
-        let last_sent = self
-            .last_sent
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match last_sent.get(&event.metric) {
-            Some(last_time) => {
-                let elapsed = Utc::now() - *last_time;
-                let elapsed_duration = elapsed.to_std().unwrap_or(Duration::ZERO);
-                elapsed_duration >= self.cooldown
-            }
-            None => true,
-        }
-    }
-
-    /// Record that an alert was sent for a metric, updating cooldown state.
-    fn record_sent(&self, metric: MetricKind) {
-        let mut last_sent = self
-            .last_sent
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        last_sent.insert(metric, Utc::now());
     }
 
     /// Build the Discord webhook payload as a JSON value.
@@ -211,17 +157,6 @@ impl Notifier for DiscordNotifier {
     }
 
     async fn send(&self, event: &AlertEvent) -> Result<(), NotifierError> {
-        if !self.should_send(event) {
-            warn!(
-                notifier = "discord",
-                metric = %event.metric,
-                severity = %event.severity,
-                cooldown_secs = self.cooldown.as_secs(),
-                "Alert suppressed by cooldown"
-            );
-            return Ok(());
-        }
-
         let payload = Self::build_payload(event, &self.hostname);
 
         info!(notifier = "discord", metric = %event.metric, severity = %event.severity, "Dispatching alert to Discord");
@@ -248,7 +183,6 @@ impl Notifier for DiscordNotifier {
             });
         }
 
-        self.record_sent(event.metric);
         Ok(())
     }
 }
@@ -355,133 +289,5 @@ mod tests {
         let footer = payload["embeds"][0]["footer"]["text"].as_str().unwrap();
         assert!(footer.contains("GuardianRS"));
         assert!(footer.contains("🌡️"));
-    }
-
-    // === Cooldown tests ===
-
-    fn make_event_with_metric(
-        metric: MetricKind,
-        severity: AlertSeverity,
-        value: f64,
-        threshold: f64,
-    ) -> AlertEvent {
-        let unit = metric.unit();
-        let message = format!(
-            "{} {} is {:.1}{} (threshold: {:.1}{})",
-            metric, severity, value, unit, threshold, unit,
-        );
-        AlertEvent {
-            timestamp: Utc::now(),
-            metric,
-            severity,
-            message,
-            value,
-            threshold,
-        }
-    }
-
-    #[test]
-    fn cooldown_zero_always_sends() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::ZERO,
-        );
-        let event = make_event(AlertSeverity::Warning, 72.0, 70.0);
-        assert!(notifier.should_send(&event));
-    }
-
-    #[test]
-    fn cooldown_first_alert_always_sends() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::from_secs(300),
-        );
-        let event = make_event(AlertSeverity::Warning, 72.0, 70.0);
-        assert!(notifier.should_send(&event));
-    }
-
-    #[test]
-    fn cooldown_suppresses_same_metric_within_window() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::from_secs(300),
-        );
-        let event = make_event(AlertSeverity::Warning, 72.0, 70.0);
-        // First send: allowed
-        assert!(notifier.should_send(&event));
-        notifier.record_sent(MetricKind::Temperature);
-        // Second send within cooldown: suppressed
-        assert!(!notifier.should_send(&event));
-    }
-
-    #[test]
-    fn cooldown_critical_bypasses_cooldown() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::from_secs(300),
-        );
-        notifier.record_sent(MetricKind::Temperature);
-        // Warning is suppressed
-        let warning_check = make_event(AlertSeverity::Warning, 72.0, 70.0);
-        assert!(!notifier.should_send(&warning_check));
-        // Critical always sends regardless of cooldown
-        let critical = make_event(AlertSeverity::Critical, 85.0, 80.0);
-        assert!(notifier.should_send(&critical));
-    }
-
-    #[test]
-    fn cooldown_independent_per_metric() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::from_secs(300),
-        );
-        let temp_event =
-            make_event_with_metric(MetricKind::Temperature, AlertSeverity::Warning, 72.0, 70.0);
-        let cpu_event =
-            make_event_with_metric(MetricKind::CpuUsage, AlertSeverity::Warning, 85.0, 80.0);
-        // Send temperature alert
-        notifier.record_sent(MetricKind::Temperature);
-        // Temperature suppressed within cooldown
-        assert!(!notifier.should_send(&temp_event));
-        // CPU still allowed — independent tracking
-        assert!(notifier.should_send(&cpu_event));
-    }
-
-    #[test]
-    fn cooldown_recovered_respects_cooldown() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::from_secs(300),
-        );
-        notifier.record_sent(MetricKind::Temperature);
-        // Recovered also respects cooldown — prevents Warning→Recovered→Warning spam
-        let recovered = make_event(AlertSeverity::Recovered, 60.0, 70.0);
-        assert!(!notifier.should_send(&recovered));
-    }
-
-    #[test]
-    fn record_sent_updates_last_sent_time() {
-        let notifier = DiscordNotifier::new(
-            "https://example.com".to_string(),
-            TEST_HOST.to_string(),
-            Duration::from_secs(300),
-        );
-        // Before record: no entry
-        {
-            let last_sent = notifier.last_sent.lock().expect("lock");
-            assert!(!last_sent.contains_key(&MetricKind::Temperature));
-        }
-        notifier.record_sent(MetricKind::Temperature);
-        // After record: entry exists
-        {
-            let last_sent = notifier.last_sent.lock().expect("lock");
-            assert!(last_sent.contains_key(&MetricKind::Temperature));
-        }
     }
 }
