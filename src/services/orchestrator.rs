@@ -90,21 +90,21 @@ impl Orchestrator {
         // === Collect ===
         let mut handles = Vec::with_capacity(self.collectors.len());
         for collector in &self.collectors {
-            handles.push(collector.collect());
+            handles.push(collector.collect_all());
         }
 
         let results = join_all(handles).await;
         let snapshots: Vec<_> = results
             .into_iter()
-            .filter_map(|r| match r {
-                Ok(snap) => Some(snap),
+            .flat_map(|r| match r {
+                Ok(snaps) => snaps,
                 Err(e @ CollectorError::Unavailable { .. }) => {
                     warn!(error = %e, "Collector warming up");
-                    None
+                    Vec::new()
                 }
                 Err(e) => {
                     error!(error = %e, "Collection failed");
-                    None
+                    Vec::new()
                 }
             })
             .collect();

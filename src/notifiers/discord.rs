@@ -55,6 +55,8 @@ impl MetricKind {
             Self::DiskUsage => "💾",
             Self::Temperature => "🌡️",
             Self::NetworkThroughput => "🌐",
+            Self::DockerUnhealthyContainers => "🐳",
+            Self::DockerDiskUsed => "📦",
         }
     }
 }

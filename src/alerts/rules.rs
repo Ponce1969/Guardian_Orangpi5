@@ -42,6 +42,16 @@ pub fn rules_from_config(config: &crate::config::ThresholdsConfig) -> Vec<Thresh
             warning: config.network_warning,
             critical: config.network_critical,
         },
+        ThresholdRule {
+            metric: MetricKind::DockerUnhealthyContainers,
+            warning: config.docker_unhealthy_warning,
+            critical: config.docker_unhealthy_critical,
+        },
+        ThresholdRule {
+            metric: MetricKind::DockerDiskUsed,
+            warning: config.docker_disk_warning,
+            critical: config.docker_disk_critical,
+        },
     ]
 }
 

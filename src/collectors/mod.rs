@@ -1,11 +1,13 @@
 pub mod cpu;
 pub mod disk;
+pub mod docker;
 pub mod memory;
 pub mod network;
 pub mod temperature;
 
 pub use cpu::CpuCollector;
 pub use disk::DiskCollector;
+pub use docker::DockerCollector;
 pub use memory::MemoryCollector;
 pub use network::NetworkCollector;
 pub use temperature::TemperatureCollector;
@@ -60,4 +62,15 @@ pub trait Collector: Send + Sync {
     /// `tokio::task::spawn_blocking` for filesystem reads that
     /// cannot be made async.
     async fn collect(&self) -> Result<MetricSnapshot, CollectorError>;
+
+    /// Collect every metric this collector produces.
+    ///
+    /// Defaults to the single snapshot from [`Collector::collect`], so a
+    /// collector that owns one measurement needs no change. A collector that
+    /// owns several related measurements — Docker container health and Docker
+    /// disk usage share one socket connection — overrides this to report them
+    /// together instead of paying for the connection once per metric.
+    async fn collect_all(&self) -> Result<Vec<MetricSnapshot>, CollectorError> {
+        self.collect().await.map(|snapshot| vec![snapshot])
+    }
 }

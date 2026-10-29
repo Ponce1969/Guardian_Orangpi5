@@ -54,6 +54,32 @@ fn default_network_critical() -> f64 {
     110.0
 }
 
+/// Default warning for unhealthy Docker containers.
+///
+/// One broken container is worth telling the operator about immediately, so the
+/// warning sits at a single container.
+fn default_docker_unhealthy_warning() -> f64 {
+    1.0
+}
+
+/// Default critical for unhealthy Docker containers.
+fn default_docker_unhealthy_critical() -> f64 {
+    2.0
+}
+
+/// Default warning for total Docker disk usage in GB.
+///
+/// Placeholder sized for a 128 GB root device shared with images, containers,
+/// volumes and the build cache. Re-measure it on the target host.
+fn default_docker_disk_warning() -> f64 {
+    40.0
+}
+
+/// Default critical for total Docker disk usage in GB.
+fn default_docker_disk_critical() -> f64 {
+    80.0
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ThresholdsConfig {
     /// CPU usage percent that triggers a warning alert.
@@ -81,6 +107,22 @@ pub struct ThresholdsConfig {
     /// Network throughput (MB/s) that triggers a critical alert.
     #[serde(default = "default_network_critical")]
     pub network_critical: f64,
+    /// Unhealthy Docker containers that trigger a warning alert.
+    ///
+    /// A container counts as unhealthy when it reports a failing healthcheck
+    /// or is stuck restarting. An `exited` container does not count: a job
+    /// that finishes is not an incident.
+    #[serde(default = "default_docker_unhealthy_warning")]
+    pub docker_unhealthy_warning: f64,
+    /// Unhealthy Docker containers that trigger a critical alert.
+    #[serde(default = "default_docker_unhealthy_critical")]
+    pub docker_unhealthy_critical: f64,
+    /// Docker disk usage (GB) that triggers a warning alert.
+    #[serde(default = "default_docker_disk_warning")]
+    pub docker_disk_warning: f64,
+    /// Docker disk usage (GB) that triggers a critical alert.
+    #[serde(default = "default_docker_disk_critical")]
+    pub docker_disk_critical: f64,
 }
 
 #[derive(Debug, Deserialize)]

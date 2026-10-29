@@ -12,6 +12,8 @@ pub enum MetricKind {
     DiskUsage,
     Temperature,
     NetworkThroughput,
+    DockerUnhealthyContainers,
+    DockerDiskUsed,
 }
 
 impl std::fmt::Display for MetricKind {
@@ -22,6 +24,8 @@ impl std::fmt::Display for MetricKind {
             Self::DiskUsage => write!(f, "disk_usage"),
             Self::Temperature => write!(f, "temperature"),
             Self::NetworkThroughput => write!(f, "network_throughput"),
+            Self::DockerUnhealthyContainers => write!(f, "docker_unhealthy_containers"),
+            Self::DockerDiskUsed => write!(f, "docker_disk_used"),
         }
     }
 }
@@ -40,6 +44,8 @@ impl MetricKind {
             Self::DiskUsage => "%",
             Self::Temperature => "°C",
             Self::NetworkThroughput => "MB/s",
+            Self::DockerUnhealthyContainers => "containers",
+            Self::DockerDiskUsed => "GB",
         }
     }
 
@@ -53,6 +59,8 @@ impl MetricKind {
             Self::DiskUsage => "Disk Usage",
             Self::Temperature => "Temperature",
             Self::NetworkThroughput => "Network Throughput",
+            Self::DockerUnhealthyContainers => "Docker Unhealthy Containers",
+            Self::DockerDiskUsed => "Docker Disk Used",
         }
     }
 }

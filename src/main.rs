@@ -8,6 +8,7 @@ use guardian_rs::alerts::engine::AlertEngine;
 use guardian_rs::alerts::rules::rules_from_config;
 use guardian_rs::collectors::cpu::CpuCollector;
 use guardian_rs::collectors::disk::DiskCollector;
+use guardian_rs::collectors::docker::DockerCollector;
 use guardian_rs::collectors::memory::MemoryCollector;
 use guardian_rs::collectors::network::NetworkCollector;
 use guardian_rs::collectors::temperature::TemperatureCollector;
@@ -52,12 +53,14 @@ fn main() -> Result<()> {
     let disk_collector = DiskCollector::new();
     let temperature_collector = TemperatureCollector::new();
     let network_collector = NetworkCollector::new();
+    let docker_collector = DockerCollector::new();
     let collectors: Vec<Box<dyn Collector>> = vec![
         Box::new(cpu_collector),
         Box::new(memory_collector),
         Box::new(disk_collector),
         Box::new(temperature_collector),
         Box::new(network_collector),
+        Box::new(docker_collector),
     ];
     info!(count = collectors.len(), "Collectors initialized");
 
