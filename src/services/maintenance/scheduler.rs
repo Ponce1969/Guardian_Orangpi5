@@ -35,21 +35,34 @@ pub enum TaskSchedule {
 pub struct ScheduledTask {
     pub name: String,
     pub schedule: TaskSchedule,
+    /// The runnable payload, when the configured kind is one this build knows.
+    ///
+    /// A task without one is reported as `Skipped` rather than crashing, so a
+    /// configuration naming a kind from a newer build degrades instead of taking
+    /// the daemon down.
+    pub backup: Option<super::backup_task::BackupTask>,
     last_run_wall: Option<NaiveDateTime>,
     last_run_mono: Option<Instant>,
     last_status: Option<MaintenanceStatus>,
 }
 
 impl ScheduledTask {
-    /// A task that has never run.
+    /// A task that has never run and has no payload yet.
     pub fn new(name: impl Into<String>, schedule: TaskSchedule) -> Self {
         Self {
             name: name.into(),
             schedule,
+            backup: None,
             last_run_wall: None,
             last_run_mono: None,
             last_status: None,
         }
+    }
+
+    /// Attach the payload this task runs.
+    pub fn with_backup(mut self, backup: super::backup_task::BackupTask) -> Self {
+        self.backup = Some(backup);
+        self
     }
 
     /// The last status this task reported, if it has run.
@@ -93,6 +106,11 @@ impl MaintenanceScheduler {
 
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+
+    /// The task at `index`, for the caller that has just been told it is due.
+    pub fn task(&self, index: usize) -> Option<&ScheduledTask> {
+        self.tasks.get(index)
     }
 
     /// The one task that should run this tick, with the reason, or `None`.

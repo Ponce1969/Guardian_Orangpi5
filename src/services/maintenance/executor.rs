@@ -298,6 +298,40 @@ async fn terminate(child: &mut Child, pid: Option<u32>, grace: Duration) {
     }
 }
 
+/// Kills the child's process group if it is dropped without being disarmed.
+///
+/// `kill_on_drop` reaps the **direct child only**, so cancelling a run future — a
+/// shutdown arriving while `pg_dump` is working — would leave anything the dump
+/// forked still running, holding its connection and its locks. This guard closes
+/// that gap: it lives on the run future's stack, so dropping the future kills the
+/// whole group.
+struct GroupKillGuard(Option<u32>);
+
+impl GroupKillGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    /// Called once the child has been reaped through the normal path.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            signal_group(pid, libc::SIGKILL);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self.0;
+        }
+    }
+}
+
 /// The production [`Executor`]: real processes, real deadlines, real signals.
 ///
 /// No test constructs this type. The suite is written against [`Executor`] with a
@@ -346,6 +380,10 @@ impl Executor for ProcessExecutor {
 
         let pid = child.id();
 
+        // Armed here so that dropping this future — a cancellation — takes the
+        // whole process group with it.
+        let mut group_guard = GroupKillGuard::new(pid);
+
         let stdout_task = tokio::spawn(read_bounded(child.stdout.take(), MAX_CAPTURE_BYTES));
         let stderr_task = tokio::spawn(read_bounded(child.stderr.take(), MAX_CAPTURE_BYTES));
 
@@ -366,6 +404,9 @@ impl Executor for ProcessExecutor {
         // Killing the group closes every pipe, so these finish promptly.
         let stdout = stdout_task.await.unwrap_or_default();
         let stderr = stderr_task.await.unwrap_or_default();
+
+        // The child is reaped; nothing is left for the guard to kill.
+        group_guard.disarm();
 
         Ok(ExecutionOutput {
             exit_code,

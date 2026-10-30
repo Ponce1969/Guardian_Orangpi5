@@ -18,7 +18,8 @@ use guardian_rs::config;
 use guardian_rs::notifiers::discord::DiscordNotifier;
 use guardian_rs::notifiers::log::LogNotifier;
 use guardian_rs::notifiers::Notifier;
-use guardian_rs::services::orchestrator::Orchestrator;
+use guardian_rs::services::maintenance::{MaintenanceScheduler, ProcessExecutor};
+use guardian_rs::services::orchestrator::{Orchestrator, OrchestratorDeps};
 
 fn main() -> Result<()> {
     // Load .env file (does not crash if missing — production uses systemd EnvironmentFile)
@@ -108,8 +109,23 @@ fn main() -> Result<()> {
 
     // === Orchestrator ===
     let poll_interval = Duration::from_secs(config.daemon.poll_interval_secs);
-    let orchestrator =
-        Orchestrator::new(collectors, Box::new(alert_engine), notifiers, poll_interval);
+
+    // The maintenance schedule is empty until task configuration lands: the
+    // wiring is complete and tested, and populating it from YAML is its own
+    // change. Saying so in the log is better than a silent no-op.
+    let maintenance = MaintenanceScheduler::default();
+    if maintenance.is_empty() {
+        info!("Maintenance disabled: no scheduled tasks configured");
+    }
+
+    let orchestrator = Orchestrator::new(OrchestratorDeps {
+        collectors,
+        alert_engine: Box::new(alert_engine),
+        notifiers,
+        poll_interval,
+        maintenance,
+        executor: Box::new(ProcessExecutor::new()),
+    });
 
     info!("Starting GuardianRS daemon");
 

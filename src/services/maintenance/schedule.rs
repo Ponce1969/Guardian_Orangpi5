@@ -53,6 +53,18 @@ pub enum DueReason {
     ScheduledMomentReached,
 }
 
+impl std::fmt::Display for DueReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::NeverRan => "never_ran",
+            Self::IntervalElapsed => "interval_elapsed",
+            Self::ScheduledMomentReached => "scheduled_moment_reached",
+        };
+
+        write!(f, "{label}")
+    }
+}
+
 /// Whether an interval schedule has come due.
 ///
 /// `elapsed_since_last` comes from a monotonic clock and is `None` when the task
