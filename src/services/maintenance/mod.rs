@@ -10,6 +10,7 @@
 pub mod backup;
 pub mod backup_task;
 pub mod executor;
+pub mod from_config;
 pub mod outcome;
 pub mod schedule;
 pub mod scheduler;
@@ -22,6 +23,7 @@ pub use executor::{
     tail_chars, ExecutionError, ExecutionOutput, ExecutionRequest, Executor, ProcessExecutor,
     MAX_CAPTURE_BYTES, MAX_DETAIL_CHARS,
 };
+pub use from_config::{scheduled_tasks, POSTGRES_BACKUP_KIND};
 pub use outcome::{
     classify_execution, should_notify, summarize, MaintenanceOutcome, MaintenanceStatus,
 };

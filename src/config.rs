@@ -35,6 +35,84 @@ pub struct GuardianConfig {
     /// Optional PostgreSQL health probe. An absent section means disabled.
     #[serde(default)]
     pub postgres: PostgresConfig,
+    /// Scheduled maintenance. An absent section means disabled.
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
+}
+
+/// Scheduled maintenance, as it appears in the configuration file.
+///
+/// This is only the shape. Turning it into runnable tasks is the job of
+/// `services::maintenance::from_config`, which is the one place allowed to know
+/// both the configuration types and the task types.
+#[derive(Debug, Deserialize, Default)]
+pub struct MaintenanceConfig {
+    /// Whether the scheduler runs at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Tasks the scheduler may run.
+    #[serde(default)]
+    pub tasks: Vec<MaintenanceTaskConfig>,
+}
+
+/// One scheduled task.
+///
+/// The connection (host, port, user and the password variable) comes from the
+/// `postgres` block, so a backup names only what is specific to it: the database
+/// and where the file goes. Writing the credentials twice would create a second
+/// place to keep in sync and a second place to leak.
+#[derive(Debug, Deserialize)]
+pub struct MaintenanceTaskConfig {
+    pub name: String,
+    /// The operation to run. Unknown kinds are a startup error, never a silent
+    /// skip: a typo must not look like a scheduled backup.
+    pub kind: String,
+    /// Interval in seconds. Mutually exclusive with `every_hours` and `daily_at`.
+    #[serde(default)]
+    pub every_secs: Option<u64>,
+    /// Interval in hours. Mutually exclusive with the other two.
+    #[serde(default)]
+    pub every_hours: Option<u64>,
+    /// Local time of day, `HH:MM`. Mutually exclusive with the intervals.
+    #[serde(default)]
+    pub daily_at: Option<String>,
+    /// Database this task backs up.
+    pub database: String,
+    /// Directory the dump is written to.
+    #[serde(default = "default_destination_dir")]
+    pub destination_dir: String,
+    /// How many backups to keep, including the one just written.
+    #[serde(default = "default_keep_backups")]
+    pub keep_backups: usize,
+    /// Deadline for the dump.
+    #[serde(default = "default_task_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Window between asking the process group to stop and forcing it.
+    #[serde(default = "default_task_grace_secs")]
+    pub grace_secs: u64,
+    /// Deadline for `pg_restore --list`.
+    #[serde(default = "default_verify_timeout_secs")]
+    pub verify_timeout_secs: u64,
+}
+
+fn default_destination_dir() -> String {
+    "/var/backups/guardianrs/postgres".to_string()
+}
+
+fn default_keep_backups() -> usize {
+    7
+}
+
+fn default_task_timeout_secs() -> u64 {
+    1800
+}
+
+fn default_task_grace_secs() -> u64 {
+    30
+}
+
+fn default_verify_timeout_secs() -> u64 {
+    120
 }
 
 #[derive(Debug, Deserialize)]

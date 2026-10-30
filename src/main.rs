@@ -18,7 +18,7 @@ use guardian_rs::config;
 use guardian_rs::notifiers::discord::DiscordNotifier;
 use guardian_rs::notifiers::log::LogNotifier;
 use guardian_rs::notifiers::Notifier;
-use guardian_rs::services::maintenance::{MaintenanceScheduler, ProcessExecutor};
+use guardian_rs::services::maintenance::{scheduled_tasks, MaintenanceScheduler, ProcessExecutor};
 use guardian_rs::services::orchestrator::{Orchestrator, OrchestratorDeps};
 
 fn main() -> Result<()> {
@@ -110,13 +110,26 @@ fn main() -> Result<()> {
     // === Orchestrator ===
     let poll_interval = Duration::from_secs(config.daemon.poll_interval_secs);
 
-    // The maintenance schedule is empty until task configuration lands: the
-    // wiring is complete and tested, and populating it from YAML is its own
-    // change. Saying so in the log is better than a silent no-op.
-    let maintenance = MaintenanceScheduler::default();
-    if maintenance.is_empty() {
-        info!("Maintenance disabled: no scheduled tasks configured");
-    }
+    // Maintenance is built from configuration and fails fast: a typo in a
+    // schedule must stop the daemon at startup, not become a monitor that runs
+    // for a week with a backup silently missing from its schedule.
+    let maintenance = if !config.maintenance.enabled {
+        info!("Maintenance disabled by configuration");
+        MaintenanceScheduler::default()
+    } else {
+        match scheduled_tasks(&config.maintenance.tasks, &config.postgres) {
+            Ok(tasks) => {
+                info!(tasks = tasks.len(), "Maintenance scheduled");
+                MaintenanceScheduler::new(tasks)
+            }
+            Err(reason) => {
+                error!(reason = %reason, "Invalid maintenance configuration");
+                return Err(anyhow::anyhow!(
+                    "invalid maintenance configuration: {reason}"
+                ));
+            }
+        }
+    };
 
     let orchestrator = Orchestrator::new(OrchestratorDeps {
         collectors,
