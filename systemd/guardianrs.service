@@ -20,7 +20,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=/proc /sys
+ReadWritePaths=/proc /sys /var/backups/guardianrs
 
 # Logging — journald integration
 StandardOutput=journal

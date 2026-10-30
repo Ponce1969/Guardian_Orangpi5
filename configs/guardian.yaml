@@ -13,33 +13,26 @@ thresholds:
   disk_critical: 90
   temp_warning: 70
   temp_critical: 80
-  # Network throughput in MB/s, aggregated over physical interfaces only.
-  # A 1 GbE link saturates near 119 MB/s, so these fire before saturation.
-  network_warning: 80
-  network_critical: 110
-  # Docker: unhealthy means a failing healthcheck or a container stuck
-  # restarting. A container that exited after finishing its job is not counted.
-  docker_unhealthy_warning: 1
-  docker_unhealthy_critical: 2
-  # Total Docker disk usage in GB (images + containers + volumes + build cache).
-  docker_disk_warning: 40
-  docker_disk_critical: 80
-  # Failed PostgreSQL probes out of 3. One failure is absorbed as transient.
-  postgres_failures_warning: 2
-  postgres_failures_critical: 3
 
 notification:
   discord:
     enabled: true
     webhook_url_env: DISCORD_WEBHOOK_URL
 
-# PostgreSQL health probe. The password is NEVER written here: this file only
-# names the environment variable that holds it, so it is safe to commit.
+# Health probe. The connection is shared with maintenance, so it is written once.
 postgres:
-  enabled: false
-  host: 127.0.0.1
+  enabled: true
+  host: "127.0.0.1"
   port: 5432
-  database: postgres
-  user: guardian
-  password_env: GUARDIAN_PG_PASSWORD
-  connect_timeout_secs: 3
+  database: "postgres"
+  user: "postgres"
+  password_env: "GUARDIAN_PG_PASSWORD"
+
+# Constructive maintenance only: this daemon backs up, it never deletes.
+maintenance:
+  enabled: true
+  tasks:
+    - name: nightly_backup
+      kind: postgres_backup
+      daily_at: "03:30"
+      database: "bookgraph"
