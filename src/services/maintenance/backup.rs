@@ -139,6 +139,23 @@ impl BackupSettings {
     }
 }
 
+/// Lists the connection detail and never the password, for the same reason
+/// [`ExecutionRequest`] implements this by hand instead of deriving it.
+///
+/// Without it, any type that derives `Debug` and holds these settings would put
+/// the secret one `tracing` call away from the journal.
+impl std::fmt::Debug for BackupSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
 /// The two commands a backup runs, and the file between them.
 #[derive(Debug, Clone)]
 pub struct BackupPlan {
@@ -402,6 +419,22 @@ mod tests {
     fn contains_pair(args: &[String], first: &str, second: &str) -> bool {
         args.windows(2)
             .any(|pair| pair[0] == first && pair[1] == second)
+    }
+
+    /// Any type that derives `Debug` and holds these settings render them, so the
+    /// secret must already be absent one level down.
+    #[test]
+    fn settings_debug_never_renders_the_password() {
+        let rendered = format!("{:?}", settings());
+
+        assert!(
+            rendered.contains("bookgraph"),
+            "useful context stays visible"
+        );
+        assert!(
+            !rendered.contains("s3cret"),
+            "the password must not be rendered: {rendered}"
+        );
     }
 
     #[test]
