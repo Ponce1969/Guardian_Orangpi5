@@ -5,12 +5,14 @@ use crate::alerts::state::AlertSeverity;
 use crate::alerts::AlertEvent;
 use crate::metrics::MetricKind;
 use crate::notifiers::{Notifier, NotifierError};
+use crate::services::maintenance::{MaintenanceOutcome, MaintenanceStatus};
 
 /// Discord embed color codes mapped to severity.
 mod color {
     pub const WARNING: u32 = 0xF0B429; // Amber/yellow — attention without alarm
     pub const CRITICAL: u32 = 0xE5534B; // Red — immediate action required
     pub const RECOVERED: u32 = 0x30A14E; // Green — back to normal
+    pub const SKIPPED: u32 = 0x808080; // Grey — nothing happened, by decision
 }
 
 /// Emoji and title prefix for severity levels.
@@ -104,6 +106,96 @@ impl DiscordNotifier {
     ///
     /// Separated from `send()` for testability — payload construction
     /// can be verified without making HTTP calls.
+    /// Icon, label and colour for a maintenance status.
+    ///
+    /// The match is exhaustive, so a status added later cannot be dispatched with
+    /// whichever style happened to be written last.
+    fn maintenance_style(status: MaintenanceStatus) -> (&'static str, &'static str, u32) {
+        match status {
+            MaintenanceStatus::Success => ("✅", "SUCCESS", color::RECOVERED),
+            MaintenanceStatus::Failed => ("❌", "FAILED", color::CRITICAL),
+            MaintenanceStatus::TimedOut => ("⏳", "TIMED OUT", color::WARNING),
+            MaintenanceStatus::Skipped => ("⏭️", "SKIPPED", color::SKIPPED),
+        }
+    }
+
+    /// Build the maintenance embed.
+    ///
+    /// `detail` arrives already bounded and redacted by the service that produced
+    /// the outcome: a notifier formats, it does not investigate.
+    fn build_maintenance_payload(
+        outcome: &MaintenanceOutcome,
+        hostname: &str,
+    ) -> serde_json::Value {
+        let (emoji, label, colour) = Self::maintenance_style(outcome.status);
+
+        let mut fields = vec![
+            serde_json::json!({
+                "name": "Duration",
+                "value": format!("{:.1}s", outcome.duration.as_secs_f64()),
+                "inline": true
+            }),
+            serde_json::json!({
+                "name": "Host",
+                "value": hostname,
+                "inline": true
+            }),
+        ];
+
+        if let Some(code) = outcome.exit_code {
+            fields.push(serde_json::json!({
+                "name": "Exit code",
+                "value": code.to_string(),
+                "inline": true
+            }));
+        }
+
+        let mut embed = serde_json::json!({
+            "title": format!("{emoji} {} — {label}", outcome.task),
+            "color": colour,
+            "fields": fields,
+            "footer": { "text": "🛠️ GuardianRS maintenance" }
+        });
+
+        // An empty description renders as a blank line in Discord, which reads as
+        // a formatting bug rather than a successful run with nothing to say.
+        if !outcome.detail.is_empty() {
+            embed["description"] = serde_json::json!(outcome.detail);
+        }
+
+        serde_json::json!({ "embeds": [embed] })
+    }
+
+    /// POST one payload to the webhook.
+    ///
+    /// Shared by both dispatch paths so the retry and error handling cannot
+    /// drift apart between alerts and maintenance.
+    async fn dispatch(&self, payload: serde_json::Value) -> Result<(), NotifierError> {
+        let response = self
+            .client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| NotifierError::SendFailed {
+                reason: format!("Discord webhook request failed: {e}"),
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            return Err(NotifierError::WebhookFailed {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        Ok(())
+    }
+
     fn build_payload(event: &AlertEvent, hostname: &str) -> serde_json::Value {
         let severity_display = event.severity.display();
         let color = event.severity.color();
@@ -164,29 +256,20 @@ impl Notifier for DiscordNotifier {
 
         info!(notifier = "discord", metric = %event.metric, severity = %event.severity, "Dispatching alert to Discord");
 
-        let response = self
-            .client
-            .post(&self.webhook_url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| NotifierError::SendFailed {
-                reason: format!("Discord webhook request failed: {}", e),
-            })?;
+        self.dispatch(payload).await
+    }
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<no body>".to_string());
-            return Err(NotifierError::WebhookFailed {
-                status: status.as_u16(),
-                body,
-            });
-        }
+    async fn send_maintenance(&self, outcome: &MaintenanceOutcome) -> Result<(), NotifierError> {
+        let payload = Self::build_maintenance_payload(outcome, &self.hostname);
 
-        Ok(())
+        info!(
+            notifier = "discord",
+            task = %outcome.task,
+            status = %outcome.status,
+            "Dispatching maintenance outcome to Discord"
+        );
+
+        self.dispatch(payload).await
     }
 }
 
@@ -211,6 +294,105 @@ mod tests {
             value,
             threshold,
         }
+    }
+
+    fn maintenance_outcome(
+        status: MaintenanceStatus,
+        exit_code: Option<i32>,
+        detail: &str,
+    ) -> MaintenanceOutcome {
+        MaintenanceOutcome {
+            task: "postgres_backup".to_string(),
+            status,
+            exit_code,
+            duration: std::time::Duration::from_secs(12),
+            detail: detail.to_string(),
+        }
+    }
+
+    fn embed_for(outcome: &MaintenanceOutcome) -> serde_json::Value {
+        DiscordNotifier::build_maintenance_payload(outcome, "orangepi")["embeds"][0].clone()
+    }
+
+    fn field<'a>(embed: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        embed["fields"]
+            .as_array()?
+            .iter()
+            .find(|field| field["name"] == name)
+    }
+
+    #[test]
+    fn maintenance_payload_marks_a_failure() {
+        let embed = embed_for(&maintenance_outcome(
+            MaintenanceStatus::Failed,
+            Some(1),
+            "connection refused",
+        ));
+
+        let title = embed["title"].as_str().expect("title");
+        assert!(title.contains("FAILED"), "title was {title}");
+        assert!(title.contains("postgres_backup"), "title was {title}");
+        assert_eq!(embed["color"], color::CRITICAL);
+        assert_eq!(embed["description"], "connection refused");
+    }
+
+    #[test]
+    fn maintenance_payload_marks_a_success() {
+        let embed = embed_for(&maintenance_outcome(
+            MaintenanceStatus::Success,
+            Some(0),
+            "",
+        ));
+
+        assert!(embed["title"].as_str().expect("title").contains("SUCCESS"));
+        assert_eq!(embed["color"], color::RECOVERED);
+    }
+
+    /// A timeout is not a plain failure: the operator reading the channel needs to
+    /// tell "it broke" from "it never finished".
+    #[test]
+    fn maintenance_payload_marks_a_timeout_distinctly() {
+        let embed = embed_for(&maintenance_outcome(MaintenanceStatus::TimedOut, None, ""));
+
+        assert!(embed["title"]
+            .as_str()
+            .expect("title")
+            .contains("TIMED OUT"));
+        assert_eq!(embed["color"], color::WARNING);
+    }
+
+    /// And a skip is neither: nothing happened, by decision.
+    #[test]
+    fn maintenance_payload_marks_a_skip_distinctly() {
+        let embed = embed_for(&maintenance_outcome(MaintenanceStatus::Skipped, None, ""));
+
+        assert!(embed["title"].as_str().expect("title").contains("SKIPPED"));
+        assert_eq!(embed["color"], color::SKIPPED);
+    }
+
+    /// An empty description renders as a blank line, which reads as a formatting
+    /// bug rather than a run with nothing to say.
+    #[test]
+    fn maintenance_payload_omits_an_empty_description() {
+        let embed = embed_for(&maintenance_outcome(
+            MaintenanceStatus::Success,
+            Some(0),
+            "",
+        ));
+
+        assert!(embed.get("description").is_none());
+    }
+
+    #[test]
+    fn maintenance_payload_includes_the_exit_code_only_when_present() {
+        let with_code = embed_for(&maintenance_outcome(MaintenanceStatus::Failed, Some(3), ""));
+        let without_code = embed_for(&maintenance_outcome(MaintenanceStatus::TimedOut, None, ""));
+
+        assert_eq!(
+            field(&with_code, "Exit code").map(|field| field["value"].clone()),
+            Some(serde_json::json!("3"))
+        );
+        assert!(field(&without_code, "Exit code").is_none());
     }
 
     #[test]

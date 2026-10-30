@@ -45,4 +45,16 @@ pub trait Notifier: Send + Sync {
     /// perform blocking I/O inside the async runtime. Network calls
     /// should use `reqwest` or equivalent async HTTP clients.
     async fn send(&self, event: &AlertEvent) -> Result<(), NotifierError>;
+
+    /// Dispatch a maintenance outcome to the external system.
+    ///
+    /// Required rather than defaulted. A default that quietly returned `Ok(())`
+    /// would let a new notifier swallow a failed backup without anyone noticing,
+    /// and a backup that fails silently is the one thing this subsystem must
+    /// never do. Every implementation states what it does with the outcome, and
+    /// the compiler enforces it.
+    async fn send_maintenance(
+        &self,
+        outcome: &crate::services::maintenance::MaintenanceOutcome,
+    ) -> Result<(), NotifierError>;
 }

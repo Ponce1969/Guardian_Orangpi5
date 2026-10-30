@@ -27,6 +27,19 @@ pub enum MaintenanceStatus {
     Skipped,
 }
 
+impl std::fmt::Display for MaintenanceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Skipped => "skipped",
+        };
+
+        write!(f, "{label}")
+    }
+}
+
 /// The record of one maintenance run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceOutcome {

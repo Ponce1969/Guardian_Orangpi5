@@ -1,8 +1,9 @@
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::alerts::AlertEvent;
 use crate::notifiers::{Notifier, NotifierError};
+use crate::services::maintenance::{MaintenanceOutcome, MaintenanceStatus};
 
 /// Dispatches alert events to structured logs via the `tracing` framework.
 ///
@@ -46,6 +47,36 @@ impl Notifier for LogNotifier {
             message = %event.message,
             "Alert event"
         );
+        Ok(())
+    }
+
+    /// Maintenance runs are logged at a level that matches their outcome: a
+    /// failure is a warning, everything else is informational.
+    async fn send_maintenance(&self, outcome: &MaintenanceOutcome) -> Result<(), NotifierError> {
+        let detail = outcome.detail.as_str();
+
+        match outcome.status {
+            MaintenanceStatus::Success => info!(
+                notifier = "log",
+                task = %outcome.task,
+                status = %outcome.status,
+                duration_secs = outcome.duration.as_secs(),
+                detail = %detail,
+                "Maintenance run succeeded"
+            ),
+            MaintenanceStatus::Failed
+            | MaintenanceStatus::TimedOut
+            | MaintenanceStatus::Skipped => warn!(
+                notifier = "log",
+                task = %outcome.task,
+                status = %outcome.status,
+                exit_code = outcome.exit_code,
+                duration_secs = outcome.duration.as_secs(),
+                detail = %detail,
+                "Maintenance run did not complete successfully"
+            ),
+        }
+
         Ok(())
     }
 }
