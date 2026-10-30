@@ -12,6 +12,7 @@ pub mod backup_task;
 pub mod executor;
 pub mod outcome;
 pub mod schedule;
+pub mod scheduler;
 
 pub use executor::{
     tail_chars, ExecutionError, ExecutionOutput, ExecutionRequest, Executor, MAX_CAPTURE_BYTES,
