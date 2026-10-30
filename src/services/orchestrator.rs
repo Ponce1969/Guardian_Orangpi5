@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use futures::future::join_all;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time;
 use tracing::{error, info, warn};
 
@@ -71,8 +71,14 @@ impl Orchestrator {
     ///
     /// # Arguments
     ///
-    /// * `shutdown_rx` - Oneshot receiver that triggers graceful shutdown
-    pub async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> anyhow::Result<()> {
+    /// The argument is a `watch` receiver rather than a oneshot because shutdown
+    /// has to be observable at more than one await point: between ticks and
+    /// inside one. A oneshot is consumed by its first observer, so a tick that had
+    /// already consumed the signal left the outer loop waiting for a second one
+    /// that never came, and systemd eventually killed the process.
+    ///
+    /// * `shutdown` - Becomes `true` when the daemon must stop.
+    pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         info!(
             interval_secs = self.poll_interval.as_secs(),
             "Starting GuardianRS orchestrator"
@@ -90,9 +96,21 @@ impl Orchestrator {
                         info!(tick, "Collection cycle");
                     }
 
-                    self.tick(tick, &mut shutdown_rx).await;
+                    // A collector that is timing out can hold this tick for longer
+                    // than systemd is willing to wait, so the tick itself races the
+                    // signal instead of only being checked between ticks.
+                    let mut tick_shutdown = shutdown.clone();
+                    let mut cancel = tick_shutdown.clone();
+
+                    tokio::select! {
+                        _ = self.tick(tick, &mut tick_shutdown) => {}
+                        _ = wait_for_shutdown(&mut cancel) => {
+                            info!("Shutdown signal received mid-cycle, stopping GuardianRS");
+                            return Ok(());
+                        }
+                    }
                 }
-                _ = &mut shutdown_rx => {
+                _ = wait_for_shutdown(&mut shutdown) => {
                     info!("Shutdown signal received, stopping GuardianRS");
                     break;
                 }
@@ -108,7 +126,7 @@ impl Orchestrator {
     /// Maintenance runs outside the metric pipeline on purpose. Folding it inside
     /// would mean a tick that collected no metrics also skipped a due backup,
     /// which is the opposite of what a backup schedule promises.
-    async fn tick(&mut self, tick: u64, shutdown: &mut oneshot::Receiver<()>) {
+    async fn tick(&mut self, tick: u64, shutdown: &mut watch::Receiver<bool>) {
         self.collect_and_alert().await;
         self.maintain(shutdown, tick).await;
     }
@@ -118,7 +136,7 @@ impl Orchestrator {
     /// At most one, always: a reboot can leave several tasks overdue together and
     /// starting them all puts a `pg_dump` and everything else into one I/O window.
     /// The others are taken by later ticks.
-    async fn maintain(&mut self, shutdown: &mut oneshot::Receiver<()>, tick: u64) {
+    async fn maintain(&mut self, shutdown: &mut watch::Receiver<bool>, tick: u64) {
         let now_wall = Local::now().naive_local();
         let now_mono = Instant::now();
 
@@ -145,7 +163,7 @@ impl Orchestrator {
 
                 tokio::select! {
                     outcome = &mut run => outcome,
-                    _ = &mut *shutdown => {
+                    _ = wait_for_shutdown(&mut *shutdown) => {
                         // Dropping `run` fires the executor's group guard, so the
                         // child and everything it forked are killed rather than
                         // left holding a connection and its locks.
@@ -248,6 +266,24 @@ impl Orchestrator {
     }
 }
 
+/// Resolve as soon as the shutdown flag is set.
+///
+/// A loop rather than a single `changed()`: the flag may already be set when this
+/// is first polled, and `changed()` would then wait for the *next* change and never
+/// return. A closed channel counts as shutdown too, so a dropped sender cannot
+/// wedge the daemon.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +295,59 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    /// A collector that outlives any reasonable shutdown deadline.
+    ///
+    /// It stands in for a probe against a host that stopped answering: the report
+    /// from the Orange Pi showed ticks continuing for a minute after SIGTERM while
+    /// three probes timed out, which is exactly this shape.
+    struct SlowCollector;
+
+    #[async_trait]
+    impl Collector for SlowCollector {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        async fn collect(
+            &self,
+        ) -> Result<crate::metrics::MetricSnapshot, crate::collectors::CollectorError> {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+
+            panic!("a collection cycle must be cancelled, not awaited to completion")
+        }
+    }
+
+    /// The regression: shutdown used to be observed only between ticks, so a tick
+    /// blocked inside a slow collector kept the daemon alive until systemd lost
+    /// patience and sent SIGKILL — which is not a graceful stop at all, and can
+    /// leave a half-written dump behind.
+    #[tokio::test]
+    async fn shutdown_interrupts_a_collection_cycle_in_progress() {
+        let orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: vec![Box::new(SlowCollector)],
+            alert_engine: Box::new(AlertEngine::new(Vec::new())),
+            notifiers: Vec::new(),
+            poll_interval: Duration::from_millis(10),
+            maintenance: MaintenanceScheduler::default(),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+        });
+
+        let (tx, rx) = watch::channel(false);
+
+        let daemon = tokio::spawn(async move { orchestrator.run(rx).await });
+
+        // Let the first tick reach the collector before signalling.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(true).expect("the daemon is listening");
+
+        tokio::time::timeout(Duration::from_secs(2), daemon)
+            .await
+            .expect("run must return when the signal fires, not when the collector does")
+            .expect("the daemon must not panic")
+            .expect("a clean shutdown is not an error");
+    }
 
     /// Captures the outcomes the orchestrator dispatches.
     #[derive(Default)]
@@ -338,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn a_due_task_runs_and_its_outcome_reaches_the_notifiers() {
         let (mut orchestrator, seen) = always_due(Recorder::default());
-        let (_tx, mut rx) = oneshot::channel();
+        let (_tx, mut rx) = watch::channel(false);
 
         orchestrator.maintain(&mut rx, 1).await;
 
@@ -354,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn a_persistent_failure_is_dispatched_on_every_run() {
         let (mut orchestrator, seen) = always_due(Recorder::default());
-        let (_tx, mut rx) = oneshot::channel();
+        let (_tx, mut rx) = watch::channel(false);
 
         orchestrator.maintain(&mut rx, 1).await;
         orchestrator.maintain(&mut rx, 2).await;
@@ -393,7 +482,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
         });
 
-        let (_tx, mut rx) = oneshot::channel();
+        let (_tx, mut rx) = watch::channel(false);
         orchestrator.maintain(&mut rx, 1).await;
 
         assert!(

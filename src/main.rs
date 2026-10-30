@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing::{error, info};
 
 use guardian_rs::alerts::engine::AlertEngine;
@@ -143,7 +143,7 @@ fn main() -> Result<()> {
     info!("Starting GuardianRS daemon");
 
     // Create shutdown channel — first signal wins, duplicates are ignored
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Build multi-thread runtime for signal handling.
     // worker_threads=2 is sufficient: one for signal listener, one for orchestrator tick.
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
         // Spawn signal handler(s).
         // On Unix: listen for both SIGTERM (systemd) and Ctrl+C (interactive).
         // On other platforms: listen for Ctrl+C only.
-        // A single oneshot channel ensures first signal wins — duplicates are ignored.
+        // A single watch channel: the first signal wins and every listener sees it.
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
                                 info!("Ctrl+C received, initiating shutdown");
                             }
                         }
-                        let _ = shutdown_tx.send(());
+                        let _ = shutdown_tx.send(true);
                     }
                     Err(error) => {
                         // A failure inside one task must not terminate the daemon,
@@ -183,7 +183,7 @@ fn main() -> Result<()> {
                         match tokio::signal::ctrl_c().await {
                             Ok(()) => {
                                 info!("Ctrl+C received, initiating shutdown");
-                                let _ = shutdown_tx.send(());
+                                let _ = shutdown_tx.send(true);
                             }
                             Err(error) => error!(
                                 %error,
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
                 match tokio::signal::ctrl_c().await {
                     Ok(()) => {
                         info!("Ctrl+C received, initiating shutdown");
-                        let _ = shutdown_tx.send(());
+                        let _ = shutdown_tx.send(true);
                     }
                     Err(error) => error!(
                         %error,
