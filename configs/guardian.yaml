@@ -36,6 +36,8 @@ postgres:
 # Constructive maintenance only: this daemon backs up, it never deletes.
 maintenance:
   enabled: true
+  # Without this the record lives in memory and every restart re-runs the backup.
+  state_path: "/var/lib/guardianrs/state.json"
   tasks:
     - name: auditor_familiar_nightly
       kind: postgres_backup

@@ -14,6 +14,7 @@ pub mod from_config;
 pub mod outcome;
 pub mod schedule;
 pub mod scheduler;
+pub mod state;
 
 pub use backup::{
     backup_filename, backups_to_prune, plan_dump, redact, BackupPlan, BackupSettings,
@@ -29,3 +30,4 @@ pub use outcome::{
 };
 pub use schedule::{daily_is_due, interval_is_due, DailyTime, DueReason};
 pub use scheduler::{MaintenanceScheduler, ScheduledTask, TaskSchedule};
+pub use state::{MaintenanceState, TaskState};

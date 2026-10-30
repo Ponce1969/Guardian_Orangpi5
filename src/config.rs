@@ -77,6 +77,12 @@ pub struct MaintenanceConfig {
     /// Whether the scheduler runs at all.
     #[serde(default)]
     pub enabled: bool,
+    /// Where completed runs are recorded, so a restart does not repeat them.
+    ///
+    /// Absent keeps the record in memory, which means every restart re-runs every
+    /// due task and the retention window fills with runs nobody scheduled.
+    #[serde(default)]
+    pub state_path: Option<String>,
     /// Tasks the scheduler may run.
     #[serde(default)]
     pub tasks: Vec<MaintenanceTaskConfig>,

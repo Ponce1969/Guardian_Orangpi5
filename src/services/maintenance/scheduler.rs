@@ -20,6 +20,7 @@ use chrono::NaiveDateTime;
 
 use super::outcome::{should_notify, MaintenanceStatus};
 use super::schedule::{daily_is_due, interval_is_due, DailyTime, DueReason};
+use super::state::{MaintenanceState, TaskState};
 
 /// How often a task wants to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +153,57 @@ impl MaintenanceScheduler {
 
         notify
     }
+
+    /// A snapshot of what has run, for persistence.
+    ///
+    /// Tasks that never ran are omitted rather than written with an empty instant:
+    /// an absent entry already means "never ran", and one representation beats two.
+    pub fn export_state(&self) -> MaintenanceState {
+        let tasks = self
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                task.last_run_wall.map(|last_run| TaskState {
+                    name: task.name.clone(),
+                    last_run,
+                })
+            })
+            .collect();
+
+        MaintenanceState::new(tasks)
+    }
+
+    /// Adopt the runs recorded by a previous process.
+    ///
+    /// The wall-clock instant is copied as is. The monotonic baseline cannot be:
+    /// an `Instant` is meaningless across a reboot, so it is reconstructed from how
+    /// long ago the run actually happened. A task that ran twenty minutes before
+    /// the restart is treated as having run twenty minutes ago — which is the whole
+    /// point, because otherwise every restart makes every task due at once and the
+    /// retention window fills with runs that were never scheduled.
+    pub fn restore(
+        &mut self,
+        state: &MaintenanceState,
+        now_wall: NaiveDateTime,
+        now_mono: Instant,
+    ) {
+        for task in &mut self.tasks {
+            let Some(elapsed) = state.elapsed_since(&task.name, now_wall) else {
+                continue;
+            };
+
+            task.last_run_wall = state.last_run(&task.name);
+
+            // `checked_sub` fails when the elapsed time reaches further back than
+            // the platform can represent from now, which happens when the run
+            // predates this boot. That run is certainly due, and leaving the
+            // baseline unset is exactly how "never ran" is expressed.
+            task.last_run_mono = elapsed
+                .to_std()
+                .ok()
+                .and_then(|ago| now_mono.checked_sub(ago));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +222,77 @@ mod tests {
 
     fn mono() -> Instant {
         Instant::now()
+    }
+
+    /// The regression this module exists for: a restart used to re-run every task,
+    /// so a daily backup ran once per restart and the retention window filled with
+    /// runs nobody scheduled.
+    #[test]
+    fn a_restored_daily_task_is_not_due_again_the_same_day() {
+        let mut first = MaintenanceScheduler::new(vec![ScheduledTask::new(
+            "backup",
+            TaskSchedule::DailyAt(daily(3, 30)),
+        )]);
+
+        first.record(0, MaintenanceStatus::Success, at(1, 3, 30), mono());
+        let recorded = first.export_state();
+        assert_eq!(recorded.len(), 1, "the finished run is recorded");
+
+        let mut restarted = MaintenanceScheduler::new(vec![ScheduledTask::new(
+            "backup",
+            TaskSchedule::DailyAt(daily(3, 30)),
+        )]);
+        restarted.restore(&recorded, at(1, 10, 0), mono());
+
+        assert!(
+            restarted.pick_due(at(1, 10, 0), mono()).is_none(),
+            "a task that ran this morning is not due again after a restart"
+        );
+    }
+
+    /// An interval's baseline is rebuilt from how long ago the run happened, not
+    /// from when the new process started.
+    #[test]
+    fn a_restored_interval_keeps_its_elapsed_time() {
+        let every = TaskSchedule::Every(Duration::from_secs(120));
+
+        let recently =
+            super::super::state::MaintenanceState::new(vec![super::super::state::TaskState {
+                name: "backup".to_string(),
+                last_run: at(1, 3, 30) - chrono::TimeDelta::seconds(30),
+            }]);
+
+        let mut scheduler = MaintenanceScheduler::new(vec![ScheduledTask::new("backup", every)]);
+        scheduler.restore(&recently, at(1, 3, 30), mono());
+
+        assert!(
+            scheduler.pick_due(at(1, 3, 30), mono()).is_none(),
+            "thirty seconds into a two minute interval is not due"
+        );
+
+        let long_ago =
+            super::super::state::MaintenanceState::new(vec![super::super::state::TaskState {
+                name: "backup".to_string(),
+                last_run: at(1, 3, 30) - chrono::TimeDelta::seconds(200),
+            }]);
+
+        let mut scheduler = MaintenanceScheduler::new(vec![ScheduledTask::new("backup", every)]);
+        scheduler.restore(&long_ago, at(1, 3, 30), mono());
+
+        assert!(
+            scheduler.pick_due(at(1, 3, 30), mono()).is_some(),
+            "past the interval the task is due again"
+        );
+    }
+
+    #[test]
+    fn a_task_that_never_ran_is_not_exported() {
+        let scheduler = MaintenanceScheduler::new(vec![ScheduledTask::new(
+            "backup",
+            TaskSchedule::DailyAt(daily(3, 30)),
+        )]);
+
+        assert!(scheduler.export_state().is_empty());
     }
 
     #[test]

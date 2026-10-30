@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -11,7 +12,7 @@ use crate::collectors::Collector;
 use crate::collectors::CollectorError;
 use crate::notifiers::Notifier;
 use crate::services::maintenance::{
-    Executor, MaintenanceOutcome, MaintenanceScheduler, MaintenanceStatus,
+    state, Executor, MaintenanceOutcome, MaintenanceScheduler, MaintenanceStatus,
 };
 
 /// Everything the orchestrator needs to run.
@@ -26,6 +27,9 @@ pub struct OrchestratorDeps {
     pub poll_interval: Duration,
     pub maintenance: MaintenanceScheduler,
     pub executor: Box<dyn Executor>,
+    /// Where completed runs are recorded. `None` keeps them in memory only, which
+    /// is what a test wants and what a host without a writable directory gets.
+    pub state_path: Option<PathBuf>,
 }
 
 /// The Orchestrator wires collectors, the alert engine, and notifiers
@@ -49,6 +53,7 @@ pub struct Orchestrator {
     poll_interval: Duration,
     maintenance: MaintenanceScheduler,
     executor: Box<dyn Executor>,
+    state_path: Option<PathBuf>,
 }
 
 impl Orchestrator {
@@ -60,6 +65,7 @@ impl Orchestrator {
             poll_interval: deps.poll_interval,
             maintenance: deps.maintenance,
             executor: deps.executor,
+            state_path: deps.state_path,
         }
     }
 
@@ -86,6 +92,10 @@ impl Orchestrator {
 
         let mut ticker = time::interval(self.poll_interval);
         let mut tick: u64 = 0;
+
+        // Before the first tick, which fires immediately: a task restored here must
+        // not be seen as never having run.
+        self.restore_state(Local::now().naive_local(), Instant::now());
 
         loop {
             tokio::select! {
@@ -188,6 +198,8 @@ impl Orchestrator {
             .maintenance
             .record(index, outcome.status, now_wall, now_mono);
 
+        self.persist_state();
+
         info!(
             task = %outcome.task,
             status = %outcome.status,
@@ -211,6 +223,54 @@ impl Orchestrator {
                     "Maintenance notification failed"
                 );
             }
+        }
+    }
+
+    /// Adopt the runs recorded by a previous process.
+    ///
+    /// An unreadable record is a warning and not a failure: refusing to start would
+    /// cost every metric to protect a scheduling hint, and the cost of carrying on
+    /// is exactly one extra run.
+    fn restore_state(&mut self, now_wall: chrono::NaiveDateTime, now_mono: Instant) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+
+        match state::load(&path) {
+            Ok(recorded) => {
+                self.maintenance.restore(&recorded, now_wall, now_mono);
+
+                info!(
+                    runs = recorded.len(),
+                    path = %path.display(),
+                    "Maintenance state restored"
+                );
+            }
+            Err(reason) => warn!(
+                reason = %reason,
+                "Ignoring unreadable maintenance state; every task will run once"
+            ),
+        }
+    }
+
+    /// Remember what has run, so a restart does not repeat it.
+    ///
+    /// A failed write is a warning, never an error: the run already happened and
+    /// the record is a convenience, while failing here would report a successful
+    /// backup as a failed cycle.
+    fn persist_state(&self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+
+        let snapshot = self.maintenance.export_state();
+
+        if let Err(reason) = state::save(path, &snapshot) {
+            warn!(
+                reason = %reason,
+                path = %path.display(),
+                "Could not record maintenance state"
+            );
         }
     }
 
@@ -318,6 +378,69 @@ mod tests {
         }
     }
 
+    /// The regression this whole module exists for: a restart used to re-run a
+    /// due task, because the scheduler only remembered in memory. Two orchestrators
+    /// share one state file and the second must stay quiet.
+    ///
+    /// The schedule is an hour-long interval rather than a daily time so the test
+    /// does not depend on what time it is when it runs.
+    #[tokio::test]
+    async fn a_restart_does_not_repeat_a_task_that_already_ran() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("guardian-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let path = dir.join("state.json");
+
+        let backup = BackupTask::new(BackupSettings::new("host", 5432, "user", "db", "secret"));
+
+        let mut first = Orchestrator::new(OrchestratorDeps {
+            collectors: Vec::new(),
+            alert_engine: Box::new(AlertEngine::new(Vec::new())),
+            notifiers: Vec::new(),
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "postgres_backup",
+                TaskSchedule::Every(Duration::from_secs(3600)),
+            )
+            .with_backup(backup.clone())]),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
+            state_path: Some(path.clone()),
+        });
+
+        let (_tx, mut rx) = watch::channel(false);
+        first.maintain(&mut rx, 1).await;
+
+        assert!(path.exists(), "the finished run is recorded on disk");
+
+        // A new process: fresh scheduler, same record on disk.
+        let recorder = Recorder::default();
+        let seen = Arc::clone(&recorder.outcomes);
+
+        let mut second = Orchestrator::new(OrchestratorDeps {
+            collectors: Vec::new(),
+            alert_engine: Box::new(AlertEngine::new(Vec::new())),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "postgres_backup",
+                TaskSchedule::Every(Duration::from_secs(3600)),
+            )
+            .with_backup(backup)]),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(vec![])))),
+            state_path: Some(path.clone()),
+        });
+
+        second.restore_state(Local::now().naive_local(), Instant::now());
+        second.maintain(&mut rx, 1).await;
+
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "a task that ran before the restart is not due again"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The regression: shutdown used to be observed only between ticks, so a tick
     /// blocked inside a slow collector kept the daemon alive until systemd lost
     /// patience and sent SIGKILL — which is not a graceful stop at all, and can
@@ -331,6 +454,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             maintenance: MaintenanceScheduler::default(),
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+            state_path: None,
         });
 
         let (tx, rx) = watch::channel(false);
@@ -419,6 +543,7 @@ mod tests {
             )
             .with_backup(backup)]),
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure(), failure()])))),
+            state_path: None,
         });
 
         (orchestrator, seen)
@@ -480,6 +605,7 @@ mod tests {
             poll_interval: Duration::from_secs(30),
             maintenance: scheduler,
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+            state_path: None,
         });
 
         let (_tx, mut rx) = watch::channel(false);

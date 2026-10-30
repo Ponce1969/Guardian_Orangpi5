@@ -145,6 +145,11 @@ fn main() -> Result<()> {
         poll_interval,
         maintenance,
         executor: Box::new(ProcessExecutor::new()),
+        state_path: config
+            .maintenance
+            .state_path
+            .as_ref()
+            .map(std::path::PathBuf::from),
     });
 
     info!("Starting GuardianRS daemon");
