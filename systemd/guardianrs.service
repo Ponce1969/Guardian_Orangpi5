@@ -3,6 +3,9 @@ Description=GuardianRS Infrastructure Monitoring Daemon
 After=network.target
 Wants=network-online.target
 
+# Rate limit lives in [Unit]; in [Service] systemd ignores it silently.
+StartLimitIntervalSec=60
+
 [Service]
 Type=simple
 User=guardianrs
@@ -12,7 +15,6 @@ ExecStart=/opt/guardianrs/guardian-rs
 EnvironmentFile=/opt/guardianrs/.env
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=60
 StartLimitBurst=3
 
 # Security hardening
