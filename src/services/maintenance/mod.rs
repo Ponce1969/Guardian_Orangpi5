@@ -7,6 +7,7 @@
 //! Nothing in either module knows how to schedule a task; that arrives with the
 //! scheduler, and it will consume these types rather than duplicate them.
 
+pub mod backup;
 pub mod executor;
 pub mod outcome;
 pub mod schedule;
