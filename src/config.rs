@@ -35,9 +35,36 @@ pub struct GuardianConfig {
     /// Optional PostgreSQL health probe. An absent section means disabled.
     #[serde(default)]
     pub postgres: PostgresConfig,
+    /// Docker monitoring. Reading the daemon socket grants a lot: a member of the
+    /// docker group can start a privileged container and own the host, so a
+    /// hardened deployment turns it off.
+    #[serde(default)]
+    pub docker: DockerConfig,
     /// Scheduled maintenance. An absent section means disabled.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+}
+
+/// Docker monitoring settings.
+///
+/// Enabled by default so an existing configuration keeps behaving as it did; a
+/// host that revokes socket access must say so here, or the collector will fail
+/// on every cycle instead of staying quiet.
+#[derive(Debug, Deserialize)]
+pub struct DockerConfig {
+    /// Whether the Docker collector runs at all.
+    #[serde(default = "default_docker_collector_enabled")]
+    pub enabled: bool,
+}
+
+fn default_docker_collector_enabled() -> bool {
+    true
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Scheduled maintenance, as it appears in the configuration file.
@@ -76,6 +103,18 @@ pub struct MaintenanceTaskConfig {
     /// Local time of day, `HH:MM`. Mutually exclusive with the intervals.
     #[serde(default)]
     pub daily_at: Option<String>,
+    /// Connection overrides. Each one falls back to the `postgres` block, so a
+    /// task names only what differs about the server it targets.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Name of the environment variable holding this task's password. Omitted
+    /// means the password from the `postgres` block.
+    #[serde(default)]
+    pub password_env: Option<String>,
     /// Database this task backs up.
     pub database: String,
     /// Directory the dump is written to.

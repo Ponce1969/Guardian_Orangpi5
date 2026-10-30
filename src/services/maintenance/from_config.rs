@@ -46,28 +46,38 @@ fn one_task(
         return Err(format!("task {}: database must not be empty", task.name));
     }
 
-    // The connection is shared with the health probe by design. A backup that
-    // carried its own credentials would be a second copy to keep in sync and a
-    // second place to leak.
-    if !postgres.enabled {
-        return Err(format!(
-            "task {}: requires the postgres block to be enabled, because it takes its connection from there",
-            task.name
-        ));
-    }
+    // Every field falls back independently, so a task that only moves to another
+    // port keeps inheriting the rest instead of repeating it.
+    let host = task.host.clone().unwrap_or_else(|| postgres.host.clone());
+    let port = task.port.unwrap_or(postgres.port);
+    let user = task.user.clone().unwrap_or_else(|| postgres.user.clone());
 
-    let password = postgres
-        .password()
-        .map_err(|error| format!("task {}: {error}", task.name))?;
+    let password = match &task.password_env {
+        // A task with its own variable stands alone: it does not need the shared
+        // block to be enabled, because it takes nothing from it.
+        Some(name) => std::env::var(name).map_err(|_| {
+            format!(
+                "task {}: missing required environment variable: {name}",
+                task.name
+            )
+        })?,
+        None => {
+            if !postgres.enabled {
+                return Err(format!(
+                    "task {}: declares no password_env, so it needs the postgres block to be enabled",
+                    task.name
+                ));
+            }
+
+            postgres
+                .password()
+                .map_err(|error| format!("task {}: {error}", task.name))?
+                .to_string()
+        }
+    };
 
     let backup = BackupTask {
-        settings: BackupSettings::new(
-            &postgres.host,
-            postgres.port,
-            &postgres.user,
-            task.database.clone(),
-            password,
-        ),
+        settings: BackupSettings::new(&host, port, &user, task.database.clone(), &password),
         destination: PathBuf::from(&task.destination_dir),
         keep_backups: task.keep_backups,
         timeout: Duration::from_secs(task.timeout_secs),
@@ -206,6 +216,59 @@ postgres:
         let _ = std::fs::remove_file(&path);
 
         result
+    }
+
+    /// A task that names its own server takes nothing from the shared block, so
+    /// the migrations between databases stay independent.
+    #[test]
+    fn a_task_can_carry_its_own_connection() {
+        std::env::set_var("GUARDIAN_TEST_AUDITOR_PW", "another-secret");
+
+        let yaml = r#"
+maintenance:
+  enabled: true
+  tasks:
+    - name: auditor
+      kind: postgres_backup
+      daily_at: "03:30"
+      host: 127.0.0.1
+      port: 5442
+      user: Gallinal2218
+      database: auditor_familiar
+      password_env: GUARDIAN_TEST_AUDITOR_PW
+"#;
+        let config = loaded(yaml).expect("valid configuration");
+
+        let tasks = scheduled_tasks(&config.maintenance.tasks, &config.postgres)
+            .expect("a task with its own connection is valid");
+
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].backup.is_some());
+    }
+
+    /// Naming a variable that does not exist must stop the daemon rather than
+    /// produce a task that fails at 03:30 with an error nobody is awake to read.
+    #[test]
+    fn a_task_pointing_at_a_missing_variable_fails_at_startup() {
+        let yaml = r#"
+maintenance:
+  enabled: true
+  tasks:
+    - name: auditor
+      kind: postgres_backup
+      daily_at: "03:30"
+      database: auditor_familiar
+      password_env: GUARDIAN_TEST_THIS_IS_NOT_SET
+"#;
+        let config = loaded(yaml).expect("the YAML itself is valid");
+
+        let error = scheduled_tasks(&config.maintenance.tasks, &config.postgres)
+            .expect_err("a missing secret must be fatal");
+
+        assert!(
+            error.contains("GUARDIAN_TEST_THIS_IS_NOT_SET"),
+            "the error names the variable: {error}"
+        );
     }
 
     const COMPLETE_TASK: &str = r#"

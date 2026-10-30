@@ -55,15 +55,22 @@ fn main() -> Result<()> {
     let disk_collector = DiskCollector::new();
     let temperature_collector = TemperatureCollector::new();
     let network_collector = NetworkCollector::new();
-    let docker_collector = DockerCollector::new();
     let mut collectors: Vec<Box<dyn Collector>> = vec![
         Box::new(cpu_collector),
         Box::new(memory_collector),
         Box::new(disk_collector),
         Box::new(temperature_collector),
         Box::new(network_collector),
-        Box::new(docker_collector),
     ];
+
+    // The Docker socket is a privilege, not a default. A host that revoked group
+    // access gets a collector that is absent rather than one that fails every
+    // cycle and teaches the operator to ignore its warnings.
+    if config.docker.enabled {
+        collectors.push(Box::new(DockerCollector::new()));
+    } else {
+        info!("Docker collector disabled by configuration");
+    }
 
     // The PostgreSQL probe is optional: it needs credentials the other
     // collectors do not, so a configuration without them must not stop the

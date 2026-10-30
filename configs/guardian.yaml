@@ -14,6 +14,11 @@ thresholds:
   temp_warning: 70
   temp_critical: 80
 
+# Reading the Docker socket makes this user a member of the docker group, which is
+# root-equivalent. A hardened host leaves it off.
+docker:
+  enabled: false
+
 notification:
   discord:
     enabled: true
@@ -23,16 +28,16 @@ notification:
 postgres:
   enabled: true
   host: "127.0.0.1"
-  port: 5432
-  database: "postgres"
-  user: "postgres"
+  port: 5442
+  database: "auditor_familiar"
+  user: "Gallinal2218"
   password_env: "GUARDIAN_PG_PASSWORD"
 
 # Constructive maintenance only: this daemon backs up, it never deletes.
 maintenance:
   enabled: true
   tasks:
-    - name: nightly_backup
+    - name: auditor_familiar_nightly
       kind: postgres_backup
       daily_at: "03:30"
-      database: "bookgraph"
+      database: "auditor_familiar"
