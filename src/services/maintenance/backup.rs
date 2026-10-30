@@ -17,6 +17,8 @@
 
 use chrono::NaiveDateTime;
 
+use super::executor::ExecutionRequest;
+
 /// Prefix every backup file this daemon writes.
 pub const BACKUP_PREFIX: &str = "guardianrs-";
 
@@ -98,6 +100,110 @@ pub fn redact(text: &str, secret: &str) -> String {
     }
 
     text.replace(secret, "***")
+}
+
+/// Everything a backup needs, with the password already resolved.
+///
+/// Deliberately has no `Debug`: the password is a field, and a derived
+/// implementation would put it one `tracing` call away from the journal.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BackupSettings {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub database: String,
+    password: String,
+}
+
+impl BackupSettings {
+    /// Build settings from a resolved configuration.
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        database: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            user: user.into(),
+            database: database.into(),
+            password: password.into(),
+        }
+    }
+
+    /// The password, for callers that need to place it in a child's environment.
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+/// The two commands a backup runs, and the file between them.
+#[derive(Debug, Clone)]
+pub struct BackupPlan {
+    /// The file `pg_dump` will write and `pg_restore` will read.
+    pub destination: std::path::PathBuf,
+    /// Writes the dump.
+    pub dump: ExecutionRequest,
+    /// Proves the dump is a readable archive.
+    pub verify: ExecutionRequest,
+}
+
+/// Build the dump and verification commands.
+///
+/// No filesystem, no clock, no process: the caller supplies the destination
+/// directory and the timestamp, so the shape of both commands is a pure fact a
+/// test can pin.
+///
+/// The dump is written with `-f`, never to stdout. Captured stdout goes through a
+/// bounded buffer, so a dump piped there would be silently truncated to a few
+/// kilobytes while still exiting zero — a corrupt backup that reports success.
+pub fn plan_dump(
+    settings: &BackupSettings,
+    destination_dir: &std::path::Path,
+    now: NaiveDateTime,
+    timeout: std::time::Duration,
+    grace: std::time::Duration,
+    verify_timeout: std::time::Duration,
+) -> BackupPlan {
+    let destination = destination_dir.join(backup_filename(&settings.database, now));
+    let destination_arg = destination.to_string_lossy().to_string();
+
+    let dump = ExecutionRequest::new(
+        "pg_dump",
+        vec![
+            "--no-password".to_string(),
+            "-Fc".to_string(),
+            "-h".to_string(),
+            settings.host.clone(),
+            "-p".to_string(),
+            settings.port.to_string(),
+            "-U".to_string(),
+            settings.user.clone(),
+            "-d".to_string(),
+            settings.database.clone(),
+            "-f".to_string(),
+            destination_arg.clone(),
+        ],
+        timeout,
+    )
+    // argv is world-readable through `ps`; the environment is not.
+    .with_env("PGPASSWORD", settings.password())
+    .with_grace(grace);
+
+    // Listing an archive reads the file, so verification carries no credentials.
+    let verify = ExecutionRequest::new(
+        "pg_restore",
+        vec!["--list".to_string(), destination_arg],
+        verify_timeout,
+    );
+
+    BackupPlan {
+        destination,
+        dump,
+        verify,
+    }
 }
 
 #[cfg(test)]
@@ -274,5 +380,106 @@ mod tests {
         let text = "pg_dump: warning: no privileges were granted";
 
         assert_eq!(redact(text, "s3cret"), text);
+    }
+
+    // === plan_dump ===
+
+    fn settings() -> BackupSettings {
+        BackupSettings::new("127.0.0.1", 5432, "guardian", "bookgraph", "s3cret")
+    }
+
+    fn plan() -> BackupPlan {
+        plan_dump(
+            &settings(),
+            std::path::Path::new("/var/backups/guardianrs/postgres"),
+            at(2026, 3, 7, 3, 30, 0),
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
+        )
+    }
+
+    fn contains_pair(args: &[String], first: &str, second: &str) -> bool {
+        args.windows(2)
+            .any(|pair| pair[0] == first && pair[1] == second)
+    }
+
+    #[test]
+    fn the_dump_is_pg_dump() {
+        assert_eq!(plan().dump.program(), "pg_dump");
+    }
+
+    /// The trap this whole shape exists to avoid: a dump written to stdout would
+    /// be truncated to the capture bound and would still exit zero.
+    #[test]
+    fn the_dump_writes_to_the_destination_file_not_stdout() {
+        let plan = plan();
+        let destination = plan.destination.to_string_lossy().to_string();
+
+        assert!(
+            contains_pair(plan.dump.args(), "-f", &destination),
+            "pg_dump must receive -f <destination>, got {:?}",
+            plan.dump.args()
+        );
+    }
+
+    #[test]
+    fn the_destination_carries_the_generated_name() {
+        // Built with `join` rather than written with slashes: `Path` equality
+        // compares the platform separator, so a hard-coded POSIX path would fail
+        // on the development machine even though the target is Linux.
+        let expected = std::path::Path::new("/var/backups/guardianrs/postgres")
+            .join("guardianrs-bookgraph-20260307T033000.dump");
+
+        assert_eq!(plan().destination, expected);
+    }
+
+    #[test]
+    fn the_dump_requests_the_custom_archive_format() {
+        assert!(plan().dump.args().iter().any(|arg| arg == "-Fc"));
+    }
+
+    #[test]
+    fn the_dump_never_prompts_for_a_password() {
+        assert!(plan().dump.args().iter().any(|arg| arg == "--no-password"));
+    }
+
+    /// argv is readable by any local user through `ps`.
+    #[test]
+    fn the_password_travels_in_the_environment_and_never_in_arguments() {
+        let plan = plan();
+
+        assert_eq!(
+            plan.dump.env(),
+            &[("PGPASSWORD".to_string(), "s3cret".to_string())]
+        );
+        assert!(
+            !plan.dump.args().iter().any(|arg| arg.contains("s3cret")),
+            "the password must never reach argv"
+        );
+    }
+
+    /// Verification reads a file, so it needs no credentials and must not carry
+    /// the secret around at all.
+    #[test]
+    fn verification_reads_the_file_without_credentials() {
+        let plan = plan();
+        let destination = plan.destination.to_string_lossy().to_string();
+
+        assert_eq!(plan.verify.program(), "pg_restore");
+        assert!(plan.verify.args().contains(&"--list".to_string()));
+        assert!(plan.verify.args().contains(&destination));
+        assert!(
+            plan.verify.env().is_empty(),
+            "listing an archive needs no secret"
+        );
+    }
+
+    #[test]
+    fn the_dump_carries_the_configured_deadline_and_grace() {
+        let plan = plan();
+
+        assert_eq!(plan.dump.timeout(), std::time::Duration::from_secs(1800));
+        assert_eq!(plan.dump.grace(), std::time::Duration::from_secs(30));
     }
 }
