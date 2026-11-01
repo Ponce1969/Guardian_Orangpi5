@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -21,6 +22,9 @@ pub enum ConfigError {
 
     #[error("Webhook URL was not resolved during config load")]
     WebhookNotResolved,
+
+    #[error("Invalid configuration: {details}")]
+    Invalid { details: String },
 }
 
 /// Top-level GuardianRS configuration.
@@ -109,20 +113,14 @@ pub struct MaintenanceTaskConfig {
     /// Local time of day, `HH:MM`. Mutually exclusive with the intervals.
     #[serde(default)]
     pub daily_at: Option<String>,
-    /// Connection overrides. Each one falls back to the `postgres` block, so a
-    /// task names only what differs about the server it targets.
+    /// Which entry of `postgres.instances` this task backs up.
+    ///
+    /// By name, so the connection exists once in the file. A name that is not
+    /// declared is a startup error rather than a task that fails at 03:30.
+    pub instance: String,
+    /// Database to back up, when it differs from the instance's own.
     #[serde(default)]
-    pub host: Option<String>,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub user: Option<String>,
-    /// Name of the environment variable holding this task's password. Omitted
-    /// means the password from the `postgres` block.
-    #[serde(default)]
-    pub password_env: Option<String>,
-    /// Database this task backs up.
-    pub database: String,
+    pub database: Option<String>,
     /// Directory the dump is written to.
     #[serde(default = "default_destination_dir")]
     pub destination_dir: String,
@@ -273,26 +271,6 @@ pub struct ThresholdsConfig {
     pub postgres_failures_critical: f64,
 }
 
-fn default_postgres_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_postgres_port() -> u16 {
-    5432
-}
-
-fn default_postgres_user() -> String {
-    "guardian".to_string()
-}
-
-fn default_postgres_database() -> String {
-    "postgres".to_string()
-}
-
-fn default_postgres_password_env() -> String {
-    "GUARDIAN_PG_PASSWORD".to_string()
-}
-
 /// Default connect timeout for a single probe, in seconds.
 ///
 /// Three failed probes are attempted per cycle, so this bounds the worst case
@@ -301,30 +279,42 @@ fn default_postgres_connect_timeout_secs() -> u64 {
     3
 }
 
-/// PostgreSQL health-check configuration.
+/// PostgreSQL monitoring configuration.
 ///
-/// The password is never part of this struct's serialized form: it carries the
+/// The password is never part of the serialized form: each instance carries the
 /// *name* of the environment variable that holds it, exactly like the Discord
 /// webhook. A configuration file is therefore safe to commit.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct PostgresConfig {
-    /// Whether the PostgreSQL probe runs at all.
+    /// Whether the PostgreSQL probes run at all.
     #[serde(default)]
     pub enabled: bool,
-    /// Host of the server or container.
-    #[serde(default = "default_postgres_host")]
+    /// One entry per database to watch.
+    ///
+    /// Empty while `enabled` is true is a startup error: it would mean the operator
+    /// asked for monitoring and configured nothing to monitor.
+    #[serde(default)]
+    pub instances: Vec<PostgresInstanceConfig>,
+}
+
+/// One database to watch.
+#[derive(Debug, Deserialize)]
+pub struct PostgresInstanceConfig {
+    /// What alerts call this database. Use the project name.
+    ///
+    /// Unique across instances: two entries sharing a name would produce alerts
+    /// nobody can tell apart.
+    pub name: String,
+    /// Host of the server or container. Explicit, with no default: this decides a
+    /// network destination, and an implicit destination is one nobody reviewed.
     pub host: String,
     /// TCP port.
-    #[serde(default = "default_postgres_port")]
     pub port: u16,
     /// Role used for the probe. It only needs permission to connect.
-    #[serde(default = "default_postgres_user")]
     pub user: String,
     /// Database the probe connects to.
-    #[serde(default = "default_postgres_database")]
     pub database: String,
     /// Name of the environment variable holding the password.
-    #[serde(default = "default_postgres_password_env")]
     pub password_env: String,
     /// Seconds to wait for a single connection attempt.
     #[serde(default = "default_postgres_connect_timeout_secs")]
@@ -334,28 +324,13 @@ pub struct PostgresConfig {
     resolved_password: Option<String>,
 }
 
-impl Default for PostgresConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            host: default_postgres_host(),
-            port: default_postgres_port(),
-            user: default_postgres_user(),
-            database: default_postgres_database(),
-            password_env: default_postgres_password_env(),
-            connect_timeout_secs: default_postgres_connect_timeout_secs(),
-            resolved_password: None,
-        }
-    }
-}
-
-impl PostgresConfig {
+impl PostgresInstanceConfig {
     /// Returns the resolved password.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::MissingEnv`] when the password was never
-    /// resolved. [`load`] resolves it whenever `enabled` is set.
+    /// Returns [`ConfigError::MissingEnv`] when the password was never resolved.
+    /// [`load`] resolves it whenever the PostgreSQL probes are enabled.
     pub fn password(&self) -> Result<&str, ConfigError> {
         self.resolved_password
             .as_deref()
@@ -437,11 +412,61 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
     // the variable name, never the value, and a missing variable is an
     // explicit load error rather than a runtime surprise.
     if config.postgres.enabled {
-        let env_var = &config.postgres.password_env;
-        let password = env::var(env_var).map_err(|_| ConfigError::MissingEnv {
-            var: env_var.clone(),
-        })?;
-        config.postgres.resolved_password = Some(password);
+        if config.postgres.instances.is_empty() {
+            return Err(ConfigError::Invalid {
+                details: "postgres.enabled is true but postgres.instances is empty".to_string(),
+            });
+        }
+
+        let mut names: HashSet<String> = HashSet::new();
+
+        for instance in &mut config.postgres.instances {
+            if instance.name.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    details: "every postgres instance needs a name".to_string(),
+                });
+            }
+
+            if !names.insert(instance.name.clone()) {
+                return Err(ConfigError::Invalid {
+                    details: format!("postgres instance {:?} is declared twice", instance.name),
+                });
+            }
+
+            let password =
+                env::var(&instance.password_env).map_err(|_| ConfigError::MissingEnv {
+                    var: instance.password_env.clone(),
+                })?;
+            instance.resolved_password = Some(password);
+        }
+    }
+
+    // Referential check: a task naming an instance that does not exist would only
+    // fail at 03:30, when nobody is awake to read it.
+    if config.maintenance.enabled && !config.maintenance.tasks.is_empty() {
+        if !config.postgres.enabled {
+            return Err(ConfigError::Invalid {
+                details: "maintenance tasks take their connection from postgres.instances, so postgres.enabled must be true".to_string(),
+            });
+        }
+
+        let declared: HashSet<&str> = config
+            .postgres
+            .instances
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect();
+
+        for task in &config.maintenance.tasks {
+            if !declared.contains(task.instance.as_str()) {
+                return Err(ConfigError::Invalid {
+                    details: format!(
+                        "task {:?}: instance {:?} is not declared in postgres.instances",
+                        task.name, task.instance
+                    ),
+                });
+            }
+        }
     }
 
     Ok(config)
@@ -523,8 +548,8 @@ notification:
 
         assert!(!config.postgres.enabled);
         assert!(
-            config.postgres.password().is_err(),
-            "a disabled probe must not hold a password"
+            config.postgres.instances.is_empty(),
+            "a disabled probe must declare no instances"
         );
     }
 
@@ -533,14 +558,14 @@ notification:
     #[test]
     fn postgres_yaml_cannot_carry_a_password() {
         let yaml = format!(
-            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  password_env: GUARDIAN_UNUSED_PG_VAR\n"
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: principal\n      host: 127.0.0.1\n      port: 5432\n      database: guardian\n      user: guardian\n      password_env: GUARDIAN_UNUSED_PG_VAR\n"
         );
 
         let config: GuardianConfig = serde_yaml::from_str(&yaml).expect("parses");
 
         assert!(config.postgres.enabled);
         assert!(
-            config.postgres.password().is_err(),
+            config.postgres.instances[0].password().is_err(),
             "reading YAML alone must never resolve a secret"
         );
     }
@@ -550,10 +575,10 @@ notification:
         const VAR: &str = "GUARDIAN_TEST_PG_PASSWORD_LOAD";
         std::env::set_var(VAR, "s3cret");
 
-        let yaml = format!("{LEGACY_YAML}\npostgres:\n  enabled: true\n  password_env: {VAR}\n");
+        let yaml = format!("{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: principal\n      host: 127.0.0.1\n      port: 5432\n      database: guardian\n      user: guardian\n      password_env: {VAR}\n");
         let config = load_from_temp(&yaml).expect("configuration loads");
 
-        assert_eq!(config.postgres.password().ok(), Some("s3cret"));
+        assert_eq!(config.postgres.instances[0].password().ok(), Some("s3cret"));
 
         std::env::remove_var(VAR);
     }
@@ -561,7 +586,7 @@ notification:
     #[test]
     fn load_fails_when_the_postgres_password_is_missing() {
         let yaml = format!(
-            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  password_env: GUARDIAN_SURELY_UNSET_PG_VAR\n"
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: principal\n      host: 127.0.0.1\n      port: 5432\n      database: guardian\n      user: guardian\n      password_env: GUARDIAN_SURELY_UNSET_PG_VAR\n"
         );
 
         let result = load_from_temp(&yaml);
@@ -597,5 +622,94 @@ notification:
             matches!(resolved, Err(ConfigError::WebhookNotResolved)),
             "webhook_url() must report the unresolved URL instead of panicking, got {resolved:?}"
         );
+    }
+
+    /// Asking for PostgreSQL monitoring and configuring nothing to monitor is an
+    /// operator mistake that must stop the daemon, not a no-op that reports healthy
+    /// monitoring forever.
+    #[test]
+    fn postgres_enabled_with_no_instances_is_rejected() {
+        let yaml = format!(
+            "{LEGACY_YAML}
+postgres:
+  enabled: true
+  instances: []
+"
+        );
+
+        let error = load_from_temp(&yaml).expect_err("no instances must be fatal");
+
+        assert!(
+            error.to_string().contains("instances"),
+            "error was: {error}"
+        );
+    }
+
+    /// Two instances sharing a name would produce alerts nobody can tell apart.
+    #[test]
+    fn duplicate_instance_names_are_rejected() {
+        const VAR: &str = "GUARDIAN_TEST_DUPLICATE_PG";
+        std::env::set_var(VAR, "s3cret");
+
+        let yaml = format!(
+            "{LEGACY_YAML}
+postgres:
+  enabled: true
+  instances:
+    - name: proyecto
+      host: 127.0.0.1
+      port: 5432
+      database: uno
+      user: guardian
+      password_env: {VAR}
+    - name: proyecto
+      host: 127.0.0.1
+      port: 5433
+      database: dos
+      user: guardian
+      password_env: {VAR}
+"
+        );
+
+        let error = load_from_temp(&yaml).expect_err("a duplicate name must be fatal");
+
+        assert!(error.to_string().contains("twice"), "error was: {error}");
+
+        std::env::remove_var(VAR);
+    }
+
+    /// A maintenance task whose instance nobody declared would only fail at 03:30,
+    /// when nobody is awake to read the error.
+    #[test]
+    fn a_task_naming_an_undeclared_instance_is_rejected() {
+        const VAR: &str = "GUARDIAN_TEST_TASK_INSTANCE_PG";
+        std::env::set_var(VAR, "s3cret");
+
+        let yaml = format!(
+            "{LEGACY_YAML}
+postgres:
+  enabled: true
+  instances:
+    - name: auditor
+      host: 127.0.0.1
+      port: 5432
+      database: auditor
+      user: guardian
+      password_env: {VAR}
+maintenance:
+  enabled: true
+  tasks:
+    - name: nocturno
+      kind: postgres_backup
+      daily_at: '03:30'
+      instance: fantasma
+"
+        );
+
+        let error = load_from_temp(&yaml).expect_err("an undeclared instance must be fatal");
+
+        assert!(error.to_string().contains("fantasma"), "error was: {error}");
+
+        std::env::remove_var(VAR);
     }
 }

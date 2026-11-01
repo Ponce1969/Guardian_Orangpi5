@@ -42,42 +42,40 @@ fn one_task(
 
     let schedule = schedule_of(task)?;
 
-    if task.database.trim().is_empty() {
+    let instance = postgres
+        .instances
+        .iter()
+        .find(|instance| instance.name == task.instance)
+        .ok_or_else(|| {
+            format!(
+                "task {}: instance {:?} is not declared in postgres.instances",
+                task.name, task.instance
+            )
+        })?;
+
+    // The instance names the database; the task overrides it only when it backs up
+    // something other than what the probe watches.
+    let database = task
+        .database
+        .clone()
+        .unwrap_or_else(|| instance.database.clone());
+
+    if database.trim().is_empty() {
         return Err(format!("task {}: database must not be empty", task.name));
     }
 
-    // Every field falls back independently, so a task that only moves to another
-    // port keeps inheriting the rest instead of repeating it.
-    let host = task.host.clone().unwrap_or_else(|| postgres.host.clone());
-    let port = task.port.unwrap_or(postgres.port);
-    let user = task.user.clone().unwrap_or_else(|| postgres.user.clone());
-
-    let password = match &task.password_env {
-        // A task with its own variable stands alone: it does not need the shared
-        // block to be enabled, because it takes nothing from it.
-        Some(name) => std::env::var(name).map_err(|_| {
-            format!(
-                "task {}: missing required environment variable: {name}",
-                task.name
-            )
-        })?,
-        None => {
-            if !postgres.enabled {
-                return Err(format!(
-                    "task {}: declares no password_env, so it needs the postgres block to be enabled",
-                    task.name
-                ));
-            }
-
-            postgres
-                .password()
-                .map_err(|error| format!("task {}: {error}", task.name))?
-                .to_string()
-        }
-    };
+    let password = instance
+        .password()
+        .map_err(|error| format!("task {}: {error}", task.name))?;
 
     let backup = BackupTask {
-        settings: BackupSettings::new(&host, port, &user, task.database.clone(), &password),
+        settings: BackupSettings::new(
+            &instance.host,
+            instance.port,
+            &instance.user,
+            database,
+            password,
+        ),
         destination: PathBuf::from(&task.destination_dir),
         keep_backups: task.keep_backups,
         timeout: Duration::from_secs(task.timeout_secs),
@@ -194,11 +192,13 @@ notification:
     webhook_url_env: DISCORD_WEBHOOK_URL
 postgres:
   enabled: true
-  host: 127.0.0.1
-  port: 5432
-  database: postgres
-  user: guardian
-  password_env: {PASSWORD_VAR}
+  instances:
+    - name: principal
+      host: 127.0.0.1
+      port: 5432
+      database: postgres
+      user: guardian
+      password_env: {PASSWORD_VAR}
 {maintenance}
 "#
         );
@@ -230,6 +230,7 @@ maintenance:
   tasks:
     - name: auditor
       kind: postgres_backup
+      instance: principal
       daily_at: "03:30"
       host: 127.0.0.1
       port: 5442
@@ -248,26 +249,24 @@ maintenance:
 
     /// Naming a variable that does not exist must stop the daemon rather than
     /// produce a task that fails at 03:30 with an error nobody is awake to read.
+    /// A task naming an instance nobody declared must stop the daemon at startup,
+    /// not become a run that fails at 03:30 with nobody awake to read it.
     #[test]
-    fn a_task_pointing_at_a_missing_variable_fails_at_startup() {
+    fn an_unknown_instance_is_rejected() {
         let yaml = r#"
 maintenance:
   enabled: true
   tasks:
     - name: auditor
       kind: postgres_backup
+      instance: does_not_exist
       daily_at: "03:30"
-      database: auditor_familiar
-      password_env: GUARDIAN_TEST_THIS_IS_NOT_SET
 "#;
-        let config = loaded(yaml).expect("the YAML itself is valid");
-
-        let error = scheduled_tasks(&config.maintenance.tasks, &config.postgres)
-            .expect_err("a missing secret must be fatal");
+        let error = loaded(yaml).expect_err("an unknown instance must be fatal at load");
 
         assert!(
-            error.contains("GUARDIAN_TEST_THIS_IS_NOT_SET"),
-            "the error names the variable: {error}"
+            error.contains("does_not_exist"),
+            "the error names the instance: {error}"
         );
     }
 
@@ -277,6 +276,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_backup
+      instance: principal
       daily_at: "03:30"
       database: bookgraph
       destination_dir: /var/backups/guardianrs/postgres
@@ -307,6 +307,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_backup
+      instance: principal
       every_hours: 24
       database: bookgraph
 "#;
@@ -334,6 +335,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_backup
+      instance: principal
       daily_at: "25:99"
       database: bookgraph
 "#;
@@ -353,6 +355,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_bakup
+      instance: principal
       daily_at: "03:30"
       database: bookgraph
 "#;
@@ -372,6 +375,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_backup
+      instance: principal
       daily_at: "03:30"
       every_hours: 24
       database: bookgraph
@@ -392,6 +396,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_backup
+      instance: principal
       database: bookgraph
 "#;
         let config = loaded(none).expect("the YAML itself is valid");
@@ -410,6 +415,7 @@ maintenance:
   tasks:
     - name: nightly
       kind: postgres_backup
+      instance: principal
       every_secs: 0
       database: bookgraph
 "#;

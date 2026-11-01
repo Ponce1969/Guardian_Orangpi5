@@ -76,15 +76,21 @@ fn main() -> Result<()> {
     // collectors do not, so a configuration without them must not stop the
     // rest of the monitoring.
     if config.postgres.enabled {
-        match PostgresCollector::from_config(&config.postgres) {
-            Ok(collector) => {
-                info!(host = %config.postgres.host, database = %config.postgres.database, "PostgreSQL probe enabled");
-                collectors.push(Box::new(collector));
-            }
-            Err(reason) => error!(
-                reason = %reason,
-                "PostgreSQL probe disabled: configuration incomplete"
-            ),
+        for instance in &config.postgres.instances {
+            // Fatal rather than skipped: running with one probe silently missing
+            // would look like healthy monitoring while a project went unwatched,
+            // which is worse than refusing to start.
+            let collector = PostgresCollector::from_config(instance).map_err(|reason| {
+                anyhow::anyhow!("postgres instance {:?}: {reason}", instance.name)
+            })?;
+
+            info!(
+                instance = %instance.name,
+                host = %instance.host,
+                database = %instance.database,
+                "PostgreSQL probe enabled"
+            );
+            collectors.push(Box::new(collector));
         }
     } else {
         info!("PostgreSQL probe disabled");

@@ -40,6 +40,9 @@ pub trait PostgresApi: Send + Sync {
 /// notifications, or execute remediation.
 pub struct PostgresCollector {
     api: Box<dyn PostgresApi>,
+    /// The configured name of this database, carried into the metric labels so an
+    /// alert says which project failed instead of leaving the operator to guess.
+    instance: String,
     host: String,
     database: String,
 }
@@ -51,7 +54,7 @@ impl PostgresCollector {
     ///
     /// Returns a reason when the password was never resolved, which means the
     /// configuration was not loaded through [`crate::config::load`].
-    pub fn from_config(config: &crate::config::PostgresConfig) -> Result<Self, String> {
+    pub fn from_config(config: &crate::config::PostgresInstanceConfig) -> Result<Self, String> {
         let password = config.password().map_err(|e| e.to_string())?;
 
         let mut pg = tokio_postgres::Config::new();
@@ -64,6 +67,7 @@ impl PostgresCollector {
 
         Ok(Self {
             api: Box::new(TokioPostgres { config: pg }),
+            instance: config.name.clone(),
             host: config.host.clone(),
             database: config.database.clone(),
         })
@@ -75,6 +79,9 @@ impl PostgresCollector {
     pub fn with_api(api: Box<dyn PostgresApi>, host: &str, database: &str) -> Self {
         Self {
             api,
+            // Tests build a collector without configuration, so the database name
+            // stands in for the instance name; nothing asserts on it.
+            instance: database.to_string(),
             host: host.to_string(),
             database: database.to_string(),
         }
@@ -104,6 +111,7 @@ impl PostgresCollector {
     /// Build the snapshot.
     fn snapshot(&self, failures: f64) -> MetricSnapshot {
         MetricSnapshot::new(MetricKind::PostgresProbeFailures, failures)
+            .with_label("instance", self.instance.clone())
             .with_label("host", self.host.clone())
             .with_label("database", self.database.clone())
             .with_label("probes", MAX_PROBES.to_string())
@@ -284,7 +292,11 @@ mod tests {
         let mut keys: Vec<&str> = snapshot.labels.keys().map(String::as_str).collect();
         keys.sort_unstable();
 
-        assert_eq!(keys, vec!["database", "host", "probes"]);
+        assert_eq!(keys, vec!["database", "host", "instance", "probes"]);
+        assert!(
+            snapshot.labels.contains_key("instance"),
+            "the configured name travels with the metric so an alert can say which project failed"
+        );
         assert_eq!(
             snapshot.labels.get("host").map(String::as_str),
             Some("127.0.0.1")

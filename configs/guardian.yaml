@@ -1,5 +1,7 @@
-# GuardianRS Default Configuration
-# Copy to configs/guardian.yaml and adjust as needed.
+# GuardianRS configuration.
+#
+# Everything operational lives here; secrets live in /opt/guardianrs/.env and this
+# file names the variables, never the values.
 
 daemon:
   poll_interval_secs: 30
@@ -14,8 +16,8 @@ thresholds:
   temp_warning: 70
   temp_critical: 80
 
-# Reading the Docker socket makes this user a member of the docker group, which is
-# root-equivalent. A hardened host leaves it off.
+# Reading the Docker socket makes the service user a member of the docker group,
+# which is root-equivalent, so a hardened host leaves this off.
 docker:
   enabled: false
 
@@ -24,22 +26,51 @@ notification:
     enabled: true
     webhook_url_env: DISCORD_WEBHOOK_URL
 
-# Health probe. The connection is shared with maintenance, so it is written once.
+# One entry per database to watch. `name` is what alerts say, so use the project.
+# `host` is explicit with no default on purpose: this decides a network destination,
+# and an implicit destination is one nobody reviewed.
 postgres:
   enabled: true
-  host: "127.0.0.1"
-  port: 5442
-  database: "auditor_familiar"
-  user: "Gallinal2218"
-  password_env: "GUARDIAN_PG_PASSWORD"
+  instances:
+    - name: auditor
+      host: "127.0.0.1"
+      port: 5442
+      database: "auditor_familiar"
+      user: "Gallinal2218"
+      password_env: "GUARDIAN_PG_AUDITOR_PASSWORD"
 
-# Constructive maintenance only: this daemon backs up, it never deletes.
+    - name: pedidos
+      host: "127.0.0.1"
+      port: 5445
+      database: "barraca"
+      user: "barraca_user"
+      password_env: "GUARDIAN_PG_PEDIDOS_PASSWORD"
+
+    - name: ecommerce
+      host: "127.0.0.1"
+      port: 5446
+      database: "web_2r_prod"
+      user: "web2r_prod_user"
+      password_env: "GUARDIAN_PG_ECOMMERCE_PASSWORD"
+
 maintenance:
   enabled: true
-  # Without this the record lives in memory and every restart re-runs the backup.
+  # Without this the record lives in memory and every restart re-runs the backups.
   state_path: "/var/lib/guardianrs/state.json"
   tasks:
-    - name: auditor_familiar_nightly
+    # Staggered on purpose: the scheduler runs one task per tick, so three tasks due
+    # at the same instant would pile their dumps into one I/O window.
+    - name: auditor_nightly
       kind: postgres_backup
       daily_at: "03:30"
-      database: "auditor_familiar"
+      instance: auditor
+
+    - name: pedidos_nightly
+      kind: postgres_backup
+      daily_at: "03:35"
+      instance: pedidos
+
+    - name: ecommerce_nightly
+      kind: postgres_backup
+      daily_at: "03:40"
+      instance: ecommerce

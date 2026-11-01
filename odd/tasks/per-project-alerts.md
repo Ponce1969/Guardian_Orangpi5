@@ -29,6 +29,10 @@ proyecto, nunca el puerto: el puerto cambia, el proyecto no.
 **S6.** Una métrica sin etiquetas se comporta como hoy: una sola identidad, un solo
 estado. Los colectores que no etiquetan no cambian de comportamiento.
 
+**S8.** Si una tarea declara un `instance` que no existe en `postgres.instances`, el
+arranque aborta con error explícito. Lo mismo vale para `postgres.enabled: true` con
+la lista vacía y para dos instancias con el mismo nombre.
+
 **S7.** `scripts/verify-credentials.sh` reproduce el camino real del daemon (TCP al
 host, no el socket del contenedor) y reporta por separado variable ausente, puerto
 cerrado y fallo de autenticación.
@@ -43,6 +47,7 @@ cerrado y fallo de autenticación.
 | T4 | S5 | inline | Renombrar `GUARDIAN_PG_PASSWORD` a `GUARDIAN_PG_AUDITOR_PASSWORD` |
 | T5 | S4 | inline | Tres tareas de backup, una por proyecto |
 | T6 | S1-S5 | inline | Verificar en el Pi: tres probes verdes y un dump por proyecto |
+| T7 | S8 | inline | Validación referencial y de unicidad al arranque |
 
 ## Log
 
@@ -66,3 +71,11 @@ ecommerce   OK   9 tablas en web_2r_prod via GUARDIAN_PG_ECOMMERCE_PASSWORD
 `kind` más sus etiquetas ordenadas, y no una etiqueta `instance` obligatoria. Razón:
 no obliga a ningún colector existente a cambiar, y una métrica sin etiquetas conserva
 exactamente el comportamiento actual (S6).
+
+**L5** (requisito agregado por el usuario, amplía el fail-fast):
+
+> Agregá al fail-fast la comprobación referencial: si una tarea declara un instance que no existe en postgres.instances, debe abortar con error explícito al arranque.
+
+**L6** (decisión confirmada por el usuario): `instance: <nombre>` en las tareas, sin
+repetir la conexión. Consecuencia: se eliminan los campos `host`, `port`, `user` y
+`password_env` de `maintenance.tasks` que existían desde `1cd004e`.
