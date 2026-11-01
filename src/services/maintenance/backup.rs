@@ -33,9 +33,20 @@ const TIMESTAMP_LEN: usize = 15;
 ///
 /// The result sorts lexicographically in chronological order, which is what
 /// makes retention a string comparison instead of date arithmetic.
+/// The prefix every backup of one database shares.
+///
+/// Retention uses it to tell its own files from another database's. The destination
+/// directory is shared by every instance, so counting all of it would let the project
+/// with more history delete the only backup another project has.
+pub fn backup_prefix(database: &str) -> String {
+    format!("{BACKUP_PREFIX}{database}-")
+}
+
+/// The file name for one database's backup taken at `now`.
 pub fn backup_filename(database: &str, now: NaiveDateTime) -> String {
     format!(
-        "{BACKUP_PREFIX}{database}-{}{BACKUP_SUFFIX}",
+        "{}{}{BACKUP_SUFFIX}",
+        backup_prefix(database),
         now.format(TIMESTAMP_FORMAT)
     )
 }

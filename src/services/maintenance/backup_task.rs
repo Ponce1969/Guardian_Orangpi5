@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 
-use super::backup::{backups_to_prune, plan_dump, redact, BackupSettings};
+use super::backup::{backup_prefix, backups_to_prune, plan_dump, redact, BackupSettings};
 use super::executor::{ExecutionError, ExecutionOutput, Executor};
 use super::outcome::{classify_execution, summarize, MaintenanceOutcome, MaintenanceStatus};
 
@@ -185,10 +185,16 @@ impl BackupTask {
         let entries = std::fs::read_dir(&self.destination)
             .map_err(|error| format!("cannot list {}: {error}", self.destination.display()))?;
 
+        let prefix = backup_prefix(&self.settings.database);
+
         let mut names = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
+                // Only this database's files: the destination is shared, so pruning
+                // the whole directory would let one project evict another's backup.
+                if name.starts_with(&prefix) {
+                    names.push(name.to_string());
+                }
             }
         }
 
@@ -485,6 +491,69 @@ mod tests {
             outcome.detail
         );
         assert!(outcome.detail.contains("***"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The destination directory is shared by every database, so retention must only
+    /// count its own files. Counting all of them lets the project with more history
+    /// delete the only backup another project has — which is what happened on the
+    /// host: the first run of a newly added project pruned a file it never wrote.
+    #[test]
+    fn pruning_one_database_leaves_another_untouched() {
+        let dir = scratch_dir("shared-destination");
+
+        let moment = |hour: u32| {
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .and_then(|date| date.and_hms_opt(hour, 0, 0))
+                .expect("valid timestamp")
+        };
+
+        for hour in [1, 2] {
+            for database in ["uno", "dos"] {
+                std::fs::write(
+                    dir.join(super::super::backup::backup_filename(
+                        database,
+                        moment(hour),
+                    )),
+                    b"dump",
+                )
+                .expect("write");
+            }
+        }
+
+        let task = BackupTask {
+            settings: super::super::backup::BackupSettings::new(
+                "host", 5432, "user", "uno", "secret",
+            ),
+            destination: dir.clone(),
+            keep_backups: 1,
+            timeout: std::time::Duration::from_secs(10),
+            grace: std::time::Duration::from_secs(1),
+            verify_timeout: std::time::Duration::from_secs(10),
+        };
+
+        let pruned = task.prune().expect("prune works");
+
+        assert_eq!(pruned, 1, "only uno's older dump is over the limit");
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names.iter().filter(|name| name.contains("-dos-")).count(),
+            2,
+            "the other database keeps both of its dumps: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|name| name.contains("-uno-")).count(),
+            1,
+            "this database keeps only the newest: {names:?}"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
