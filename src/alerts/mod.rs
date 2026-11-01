@@ -5,7 +5,7 @@ pub mod state;
 pub use engine::AlertEngine;
 pub use engine::AlertEvaluator;
 pub use rules::{ThresholdRule, ThresholdsConfig};
-pub use state::{AlertSeverity, AlertState, AlertStateTracker};
+pub use state::{AlertKey, AlertSeverity, AlertState, AlertStateTracker};
 
 use crate::metrics::MetricKind;
 
@@ -22,4 +22,9 @@ pub struct AlertEvent {
     pub message: String,
     pub value: f64,
     pub threshold: f64,
+    /// The labels that identify the series this event is about, sorted.
+    ///
+    /// Without them a message says the metric failed and leaves the operator to
+    /// work out which of three databases it was.
+    pub labels: Vec<(String, String)>,
 }

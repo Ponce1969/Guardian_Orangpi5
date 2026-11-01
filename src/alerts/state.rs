@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::metrics::MetricKind;
+use crate::metrics::{MetricKind, MetricSnapshot};
 
 /// The severity level of an alert event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,13 +38,70 @@ pub enum AlertState {
     Critical,
 }
 
+/// What an alert is about: a metric kind plus the labels that tell one series from
+/// another.
+///
+/// Keying state by `MetricKind` alone was invisible with one PostgreSQL instance and
+/// wrong with three: the second instance going critical produced no transition
+/// because the first already had, and the first recovering emitted a `Recovered`
+/// while the second was still down.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlertKey {
+    kind: MetricKind,
+    /// Sorted at construction so two snapshots carrying the same labels in a
+    /// different iteration order produce the same key.
+    labels: Vec<(String, String)>,
+}
+
+impl AlertKey {
+    /// The key for a metric with no labels: exactly the old behaviour, one state per
+    /// kind.
+    pub fn for_kind(kind: MetricKind) -> Self {
+        Self {
+            kind,
+            labels: Vec::new(),
+        }
+    }
+
+    /// The key a snapshot belongs to.
+    pub fn from_snapshot(snapshot: &MetricSnapshot) -> Self {
+        let mut labels: Vec<(String, String)> = snapshot
+            .labels
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        labels.sort();
+
+        Self {
+            kind: snapshot.kind,
+            labels,
+        }
+    }
+
+    /// The metric this key belongs to.
+    pub fn kind(&self) -> MetricKind {
+        self.kind
+    }
+
+    /// The labels that make this key distinct, in a stable order.
+    pub fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+}
+
+impl From<MetricKind> for AlertKey {
+    fn from(kind: MetricKind) -> Self {
+        Self::for_kind(kind)
+    }
+}
+
 /// Tracks the current alert state per metric kind.
 ///
 /// The tracker owns the state. The AlertEngine queries it to detect
 /// transitions and decides whether to emit an `AlertEvent`.
 #[derive(Default)]
 pub struct AlertStateTracker {
-    states: HashMap<MetricKind, AlertState>,
+    states: HashMap<AlertKey, AlertState>,
 }
 
 impl AlertStateTracker {
@@ -54,8 +111,8 @@ impl AlertStateTracker {
     }
 
     /// Get the current state for a metric. Returns Normal if never seen.
-    pub fn get(&self, kind: MetricKind) -> AlertState {
-        self.states.get(&kind).copied().unwrap_or_default()
+    pub fn get(&self, key: impl Into<AlertKey>) -> AlertState {
+        self.states.get(&key.into()).copied().unwrap_or_default()
     }
 
     /// Transition to a new state. Returns `Some(old_state)` if the
@@ -63,8 +120,12 @@ impl AlertStateTracker {
     ///
     /// Special case: transitioning from implicit Normal (never seen)
     /// to explicit Normal is NOT a transition — no event should fire.
-    pub fn transition(&mut self, kind: MetricKind, new_state: AlertState) -> Option<AlertState> {
-        let old_state = self.states.insert(kind, new_state);
+    pub fn transition(
+        &mut self,
+        key: impl Into<AlertKey>,
+        new_state: AlertState,
+    ) -> Option<AlertState> {
+        let old_state = self.states.insert(key.into(), new_state);
         match old_state {
             // Same state — no transition.
             Some(prev) if prev == new_state => None,

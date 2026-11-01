@@ -98,6 +98,7 @@ mod tests {
             message: "temperature WARNING is 72.0°C".to_string(),
             value: 72.0,
             threshold: 70.0,
+            labels: Vec::new(),
         };
 
         let result = notifier.send(&event).await;

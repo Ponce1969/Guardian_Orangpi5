@@ -2,7 +2,7 @@ use chrono::Utc;
 use thiserror::Error;
 
 use crate::alerts::rules::ThresholdRule;
-use crate::alerts::state::{AlertSeverity, AlertState, AlertStateTracker};
+use crate::alerts::state::{AlertKey, AlertSeverity, AlertState, AlertStateTracker};
 use crate::alerts::AlertEvent;
 use crate::metrics::{MetricKind, MetricSnapshot};
 
@@ -91,10 +91,11 @@ impl AlertEvaluator for AlertEngine {
             None => return Vec::new(),
         };
 
-        let old_state = self.tracker.get(snapshot.kind);
+        let key = AlertKey::from_snapshot(snapshot);
+        let old_state = self.tracker.get(key.clone());
 
         // Only emit an event on state transitions.
-        let Some(_prev) = self.tracker.transition(snapshot.kind, new_state) else {
+        let Some(_prev) = self.tracker.transition(key.clone(), new_state) else {
             return Vec::new();
         };
 
@@ -120,10 +121,28 @@ impl AlertEvaluator for AlertEngine {
         };
 
         let unit = snapshot.kind.unit();
-        let message = format!(
+        // A symbol unit attaches to the number; a word unit needs a space. Without
+        // this the message read "3.0failures".
+        let suffix = if unit.chars().all(char::is_alphabetic) {
+            format!(" {unit}")
+        } else {
+            unit.to_string()
+        };
+
+        let mut message = format!(
             "{} {} is {:.1}{} (threshold: {:.1}{})",
-            snapshot.kind, severity, snapshot.value, unit, threshold, unit,
+            snapshot.kind, severity, snapshot.value, suffix, threshold, suffix,
         );
+
+        if !key.labels().is_empty() {
+            let rendered = key
+                .labels()
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(" [{rendered}]"));
+        }
 
         vec![AlertEvent {
             timestamp: Utc::now(),
@@ -132,6 +151,7 @@ impl AlertEvaluator for AlertEngine {
             message,
             value: snapshot.value,
             threshold,
+            labels: key.labels().to_vec(),
         }]
     }
 }

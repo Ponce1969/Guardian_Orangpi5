@@ -293,6 +293,7 @@ mod tests {
             message,
             value,
             threshold,
+            labels: Vec::new(),
         }
     }
 
