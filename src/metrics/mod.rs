@@ -1,3 +1,3 @@
 pub mod types;
 
-pub use types::{MetricKind, MetricSnapshot};
+pub use types::{unit_suffix, MetricKind, MetricSnapshot};

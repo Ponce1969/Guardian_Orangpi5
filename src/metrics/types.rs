@@ -108,6 +108,20 @@ impl MetricSnapshot {
     }
 }
 
+/// How a unit attaches to a number.
+///
+/// A symbol belongs against the digits (`80.0%`, `72.0°C`); a word needs a space or
+/// the message reads `3.0failures`. This lives here, next to `unit()`, because the
+/// alert message and the Discord embed each formatted it themselves and only one of
+/// them was fixed.
+pub fn unit_suffix(unit: &str) -> String {
+    if unit.chars().all(char::is_alphabetic) {
+        format!(" {unit}")
+    } else {
+        unit.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

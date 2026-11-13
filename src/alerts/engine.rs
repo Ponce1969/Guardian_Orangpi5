@@ -120,14 +120,7 @@ impl AlertEvaluator for AlertEngine {
             AlertSeverity::Recovered => rule.map(|r| r.warning).unwrap_or(0.0),
         };
 
-        let unit = snapshot.kind.unit();
-        // A symbol unit attaches to the number; a word unit needs a space. Without
-        // this the message read "3.0failures".
-        let suffix = if unit.chars().all(char::is_alphabetic) {
-            format!(" {unit}")
-        } else {
-            unit.to_string()
-        };
+        let suffix = crate::metrics::unit_suffix(snapshot.kind.unit());
 
         let mut message = format!(
             "{} {} is {:.1}{} (threshold: {:.1}{})",

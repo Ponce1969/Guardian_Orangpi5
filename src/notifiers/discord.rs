@@ -196,6 +196,20 @@ impl DiscordNotifier {
         Ok(())
     }
 
+    /// What this alert is about: the configured instance when the metric carries one,
+    /// otherwise the host.
+    ///
+    /// Three databases share one metric kind, so without this the three alerts read
+    /// identically and the operator cannot tell which one is on fire.
+    fn subject<'a>(event: &'a AlertEvent, hostname: &'a str) -> &'a str {
+        event
+            .labels
+            .iter()
+            .find(|(name, _)| name == "instance")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or(hostname)
+    }
+
     fn build_payload(event: &AlertEvent, hostname: &str) -> serde_json::Value {
         let severity_display = event.severity.display();
         let color = event.severity.color();
@@ -205,14 +219,18 @@ impl DiscordNotifier {
 
         let title = format!(
             "{} {} {} — {}",
-            severity_display.emoji, metric_name, severity_display.title_prefix, hostname
+            severity_display.emoji,
+            metric_name,
+            severity_display.title_prefix,
+            Self::subject(event, hostname)
         );
 
-        let value_field = format!("{:.1}{}", event.value, unit);
+        let suffix = crate::metrics::unit_suffix(unit);
+        let value_field = format!("{:.1}{suffix}", event.value);
         let threshold_field = if event.severity == AlertSeverity::Recovered {
-            format!("recovered below {:.1}{}", event.threshold, unit)
+            format!("recovered below {:.1}{suffix}", event.threshold)
         } else {
-            format!("{:.1}{}", event.threshold, unit)
+            format!("{:.1}{suffix}", event.threshold)
         };
 
         serde_json::json!({
@@ -475,5 +493,72 @@ mod tests {
         let footer = payload["embeds"][0]["footer"]["text"].as_str().unwrap();
         assert!(footer.contains("GuardianRS"));
         assert!(footer.contains("🌡️"));
+    }
+
+    fn probe_event(
+        labels: Vec<(String, String)>,
+        value: f64,
+        severity: AlertSeverity,
+    ) -> AlertEvent {
+        AlertEvent {
+            timestamp: Utc::now(),
+            metric: MetricKind::PostgresProbeFailures,
+            severity,
+            message: String::new(),
+            value,
+            threshold: 2.0,
+            labels,
+        }
+    }
+
+    /// Three databases share one metric kind. Without the instance in the title the
+    /// three alerts read identically, which is what happened on the host: three
+    /// "PostgreSQL Probe Failures Recovered" messages nobody could tell apart.
+    #[test]
+    fn the_title_names_the_instance_the_alert_is_about() {
+        let event = probe_event(
+            vec![
+                ("database".to_string(), "web_2r_prod".to_string()),
+                ("instance".to_string(), "ecommerce".to_string()),
+            ],
+            3.0,
+            AlertSeverity::Critical,
+        );
+
+        let payload = DiscordNotifier::build_payload(&event, TEST_HOST);
+        let title = payload["embeds"][0]["title"].as_str().unwrap_or_default();
+
+        assert!(
+            title.contains("ecommerce"),
+            "the title names the project, not just the host: {title}"
+        );
+    }
+
+    /// A metric with no labels keeps the old behaviour: the host is the subject.
+    #[test]
+    fn an_alert_without_labels_still_names_the_host() {
+        let event = probe_event(Vec::new(), 80.0, AlertSeverity::Warning);
+
+        let payload = DiscordNotifier::build_payload(&event, TEST_HOST);
+        let title = payload["embeds"][0]["title"].as_str().unwrap_or_default();
+
+        assert!(
+            title.contains(TEST_HOST),
+            "no labels means the host: {title}"
+        );
+    }
+
+    /// The message path had this fixed and the embed path did not, so the same alert
+    /// read "3.0 failures" in the log and "3.0failures" in Discord.
+    #[test]
+    fn a_word_unit_is_separated_from_the_number() {
+        let event = probe_event(Vec::new(), 3.0, AlertSeverity::Critical);
+
+        let payload = DiscordNotifier::build_payload(&event, TEST_HOST);
+        let current = payload["embeds"][0]["fields"][0]["value"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert_eq!(current, "3.0 failures", "a word unit needs a space");
     }
 }
