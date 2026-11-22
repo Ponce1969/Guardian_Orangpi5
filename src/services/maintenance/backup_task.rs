@@ -5,8 +5,9 @@
 //!
 //! 1. `pg_dump` must exit zero;
 //! 2. the file it claims to have written must exist and be non-empty;
-//! 3. `pg_restore --list` must be able to read it as an archive;
-//! 4. only then are older backups pruned.
+//! 3. `pg_restore --list` must read its table of contents;
+//! 4. `pg_restore` must read its data back without error;
+//! 5. only then are older backups pruned.
 //!
 //! Each step exists because the previous one can lie. A dump can exit zero and
 //! write nothing; it can write a truncated file; and a file can be present and
@@ -18,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 
-use super::backup::{backups_to_prune, belongs_to_database, plan_dump, redact, BackupSettings};
+use super::backup::{
+    backups_to_prune, belongs_to_database, plan_dump, redact, BackupPlan, BackupSettings,
+};
 use super::executor::{ExecutionError, ExecutionOutput, Executor};
 use super::outcome::{classify_execution, summarize, MaintenanceOutcome, MaintenanceStatus};
 
@@ -70,6 +73,15 @@ impl BackupTask {
             self.verify_timeout,
         );
 
+        if let Err(error) = std::fs::create_dir_all(&self.destination) {
+            return self.outcome(
+                started,
+                MaintenanceStatus::Failed,
+                None,
+                &format!("cannot create {}: {error}", self.destination.display()),
+            );
+        }
+
         // 1. The dump itself.
         let dump = match executor.run(&plan.dump).await {
             Ok(output) => output,
@@ -84,6 +96,7 @@ impl BackupTask {
                 );
             }
             Err(ExecutionError::Collect { reason }) => {
+                self.discard(&plan);
                 return self.outcome(
                     started,
                     MaintenanceStatus::Failed,
@@ -95,16 +108,18 @@ impl BackupTask {
 
         let dump_status = classify_execution(&dump);
         if dump_status != MaintenanceStatus::Success {
+            self.discard(&plan);
             return self.outcome(started, dump_status, dump.exit_code, &self.detail(&dump));
         }
 
         // 2. The file it claims to have written. An exit code of zero is not
         // evidence that bytes reached the disk.
-        let bytes = std::fs::metadata(&plan.destination)
+        let bytes = std::fs::metadata(&plan.partial)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
 
         if bytes == 0 {
+            self.discard(&plan);
             return self.outcome(
                 started,
                 MaintenanceStatus::Failed,
@@ -125,6 +140,7 @@ impl BackupTask {
                 );
             }
             Err(ExecutionError::Collect { reason }) => {
+                self.discard(&plan);
                 return self.outcome(
                     started,
                     MaintenanceStatus::Failed,
@@ -135,6 +151,7 @@ impl BackupTask {
         };
 
         if classify_execution(&verify) != MaintenanceStatus::Success {
+            self.discard(&plan);
             return self.outcome(
                 started,
                 MaintenanceStatus::Failed,
@@ -143,6 +160,46 @@ impl BackupTask {
                     "the dump is not a readable archive: {}",
                     self.detail(&verify)
                 ),
+            );
+        }
+
+        let restore = match executor.run(&plan.restore).await {
+            Ok(output) => output,
+            Err(error) => {
+                self.discard(&plan);
+                let reason = match error {
+                    ExecutionError::Spawn { reason, .. } | ExecutionError::Collect { reason } => {
+                        reason
+                    }
+                };
+                return self.outcome(
+                    started,
+                    MaintenanceStatus::Failed,
+                    None,
+                    &format!("the dump data cannot be read: {reason}"),
+                );
+            }
+        };
+
+        if classify_execution(&restore) != MaintenanceStatus::Success {
+            self.discard(&plan);
+            return self.outcome(
+                started,
+                MaintenanceStatus::Failed,
+                restore.exit_code,
+                &format!("the dump is not restorable: {}", self.detail(&restore)),
+            );
+        }
+
+        let _ = std::fs::remove_file(&plan.restore_temp);
+
+        if let Err(error) = std::fs::rename(&plan.partial, &plan.destination) {
+            self.discard(&plan);
+            return self.outcome(
+                started,
+                MaintenanceStatus::Failed,
+                None,
+                &format!("cannot publish the backup: {error}"),
             );
         }
 
@@ -178,6 +235,12 @@ impl BackupTask {
             duration: started.elapsed(),
             detail: detail.to_string(),
         }
+    }
+
+    /// Remove whatever a failed run may have left behind.
+    fn discard(&self, plan: &BackupPlan) {
+        let _ = std::fs::remove_file(&plan.partial);
+        let _ = std::fs::remove_file(&plan.restore_temp);
     }
 
     /// Delete the backups beyond the retention limit, returning how many went.
@@ -329,7 +392,7 @@ mod tests {
             task.grace,
             task.verify_timeout,
         );
-        std::fs::write(&plan.destination, bytes).expect("dump written");
+        std::fs::write(&plan.partial, bytes).expect("dump written");
     }
 
     fn now() -> NaiveDateTime {
@@ -343,7 +406,7 @@ mod tests {
         let dir = scratch_dir("success");
         let task = task_in(&dir, 7);
         write_dump(&task, now(), b"valid archive");
-        let (executor, _) = executor_with(vec![Ok(ok(0)), Ok(ok(0))]);
+        let (executor, _) = executor_with(vec![Ok(ok(0)), Ok(ok(0)), Ok(ok(0))]);
 
         let outcome = task.run(&executor, now()).await;
 
@@ -463,7 +526,7 @@ mod tests {
         );
         std::fs::write(dir.join(&old), b"previous backup").expect("old backup");
         write_dump(&task, now(), b"valid archive");
-        let (executor, _) = executor_with(vec![Ok(ok(0)), Ok(ok(0))]);
+        let (executor, _) = executor_with(vec![Ok(ok(0)), Ok(ok(0)), Ok(ok(0))]);
 
         task.run(&executor, now()).await;
 
@@ -614,6 +677,63 @@ mod tests {
             "the database whose name extends the other keeps both dumps: {names:?}"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_destination_directory_is_created_before_the_dump() {
+        let dir = scratch_dir("mkdir");
+        let nested = dir.join("postgres");
+        let task = task_in(&nested, 7);
+        let (executor, _) = executor_with(vec![Ok(ok(0))]);
+
+        let outcome = task.run(&executor, now()).await;
+
+        assert_eq!(outcome.status, MaintenanceStatus::Failed);
+        assert!(nested.is_dir(), "the destination directory was not created");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_data_pass_keeps_the_previous_backup_and_leaves_nothing() {
+        let dir = scratch_dir("data-fail");
+        let task = task_in(&dir, 1);
+        let yesterday = now() - chrono::Duration::days(1);
+        let previous = plan_dump(
+            &task.settings,
+            &dir,
+            yesterday,
+            task.timeout,
+            task.grace,
+            task.verify_timeout,
+        );
+        std::fs::write(&previous.destination, b"previous archive").expect("previous");
+        let current = plan_dump(
+            &task.settings,
+            &dir,
+            now(),
+            task.timeout,
+            task.grace,
+            task.verify_timeout,
+        );
+        std::fs::write(&current.partial, b"new archive").expect("new dump");
+
+        let (executor, _) = executor_with(vec![
+            Ok(ok(0)),
+            Ok(ok(0)),
+            Ok(ok_with_stderr(1, "corrupt data")),
+        ]);
+        let outcome = task.run(&executor, now()).await;
+
+        assert_eq!(outcome.status, MaintenanceStatus::Failed);
+        assert!(
+            previous.destination.exists(),
+            "a failed verification must not prune the previous backup"
+        );
+        assert!(
+            !current.partial.exists() && !current.restore_temp.exists(),
+            "a failed run left its scratch files behind"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

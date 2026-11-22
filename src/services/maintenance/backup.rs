@@ -185,12 +185,25 @@ impl std::fmt::Debug for BackupSettings {
 /// The two commands a backup runs, and the file between them.
 #[derive(Debug, Clone)]
 pub struct BackupPlan {
-    /// The file `pg_dump` will write and `pg_restore` will read.
+    /// The name the verified archive is published under.
     pub destination: std::path::PathBuf,
+    /// Where the dump lives until it is proven.
+    pub partial: std::path::PathBuf,
+    /// The file the data pass restores into, removed afterwards.
+    pub restore_temp: std::path::PathBuf,
     /// Writes the dump.
     pub dump: ExecutionRequest,
     /// Proves the dump is a readable archive.
     pub verify: ExecutionRequest,
+    /// Proves the archive's data can be read, not just its table of contents.
+    pub restore: ExecutionRequest,
+}
+
+/// Append a suffix to a path, keeping any extension intact.
+fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
 }
 
 /// Build the dump and verification commands.
@@ -211,7 +224,11 @@ pub fn plan_dump(
     verify_timeout: std::time::Duration,
 ) -> BackupPlan {
     let destination = destination_dir.join(backup_filename(&settings.database, now));
-    let destination_arg = destination.to_string_lossy().to_string();
+    // The dump is written beside its final name: a run that dies mid-write must
+    // never leave a truncated archive where retention expects a good backup.
+    let partial = with_suffix(&destination, ".partial");
+    let restore_temp = with_suffix(&destination, ".restore");
+    let partial_arg = partial.to_string_lossy().to_string();
 
     let dump = ExecutionRequest::new(
         "pg_dump",
@@ -227,7 +244,7 @@ pub fn plan_dump(
             "-d".to_string(),
             settings.database.clone(),
             "-f".to_string(),
-            destination_arg.clone(),
+            partial_arg.clone(),
         ],
         timeout,
     )
@@ -235,17 +252,32 @@ pub fn plan_dump(
     .with_env("PGPASSWORD", settings.password())
     .with_grace(grace);
 
-    // Listing an archive reads the file, so verification carries no credentials.
+    // Listing reads the table of contents only; neither request needs credentials.
     let verify = ExecutionRequest::new(
         "pg_restore",
-        vec!["--list".to_string(), destination_arg],
+        vec!["--list".to_string(), partial_arg.clone()],
+        verify_timeout,
+    );
+
+    // Reading the data back is what proves the archive is restorable, and
+    // retention depends on that proof rather than on a header.
+    let restore = ExecutionRequest::new(
+        "pg_restore",
+        vec![
+            "--file".to_string(),
+            restore_temp.to_string_lossy().to_string(),
+            partial_arg,
+        ],
         verify_timeout,
     );
 
     BackupPlan {
         destination,
+        partial,
+        restore_temp,
         dump,
         verify,
+        restore,
     }
 }
 
@@ -473,12 +505,16 @@ mod tests {
     #[test]
     fn the_dump_writes_to_the_destination_file_not_stdout() {
         let plan = plan();
-        let destination = plan.destination.to_string_lossy().to_string();
+        let partial = plan.partial.to_string_lossy().to_string();
 
         assert!(
-            contains_pair(plan.dump.args(), "-f", &destination),
-            "pg_dump must receive -f <destination>, got {:?}",
+            contains_pair(plan.dump.args(), "-f", &partial),
+            "pg_dump must receive -f <partial>, got {:?}",
             plan.dump.args()
+        );
+        assert!(
+            partial.starts_with(&plan.destination.to_string_lossy().to_string()),
+            "the partial file must sit beside the name it will be published under"
         );
     }
 
@@ -523,14 +559,24 @@ mod tests {
     #[test]
     fn verification_reads_the_file_without_credentials() {
         let plan = plan();
-        let destination = plan.destination.to_string_lossy().to_string();
+        let partial = plan.partial.to_string_lossy().to_string();
 
         assert_eq!(plan.verify.program(), "pg_restore");
         assert!(plan.verify.args().contains(&"--list".to_string()));
-        assert!(plan.verify.args().contains(&destination));
+        assert!(plan.verify.args().contains(&partial));
         assert!(
             plan.verify.env().is_empty(),
             "listing an archive needs no secret"
+        );
+        assert_eq!(plan.restore.program(), "pg_restore");
+        assert!(plan.restore.args().contains(&partial));
+        assert!(plan
+            .restore
+            .args()
+            .contains(&plan.restore_temp.to_string_lossy().to_string()));
+        assert!(
+            plan.restore.env().is_empty(),
+            "reading the data needs no secret either"
         );
     }
 
