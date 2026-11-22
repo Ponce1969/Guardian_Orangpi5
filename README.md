@@ -164,6 +164,48 @@ The deploy script handles everything:
 - Installs and starts the systemd service
 - Shows initial status
 
+### What the service needs on disk
+
+The unit runs with `ProtectSystem=strict`, so every path the daemon writes must be
+declared in `ReadWritePaths`. A missing entry does not stop the service — it fails
+quietly, which is worse:
+
+| Path | Why |
+|------|-----|
+| `/var/backups/guardianrs` | where maintenance writes the dumps |
+| `/var/lib/guardianrs` | where it records which tasks have already run |
+
+Without the backup path the dump fails with `Read-only file system`. Without the
+state path the daemon runs normally and the state file is silently never written, so
+every restart re-runs every task.
+
+### Journald must be given a size with a unit
+
+`SystemMaxUse=500` means **500 bytes**, not 500 megabytes: systemd reads a bare
+number as bytes. With that value journald discards everything continuously, and
+`journalctl -u guardianrs` shows almost nothing — which reads exactly like a daemon
+that has nothing to say.
+
+```
+[Journal]
+SystemMaxUse=500M
+```
+
+### What a healthy start looks like
+
+```
+PostgreSQL probe enabled instance=auditor   host=127.0.0.1 database=auditor_familiar
+PostgreSQL probe enabled instance=pedidos   host=127.0.0.1 database=barraca
+PostgreSQL probe enabled instance=ecommerce host=127.0.0.1 database=web_2r_prod
+Collectors initialized count=8
+Maintenance scheduled tasks=3
+Maintenance state restored runs=3 path=/var/lib/guardianrs/state.json
+```
+
+`count=8` is five host collectors plus three database probes. After a host reboot
+alerts are deliberately not evaluated for `daemon.startup_grace_secs` (default 180),
+because the databases are still starting: the messages would be true but useless.
+
 ### Operational Commands
 
 | Action | Command |
