@@ -30,6 +30,8 @@ pub struct OrchestratorDeps {
     /// Where completed runs are recorded. `None` keeps them in memory only, which
     /// is what a test wants and what a host without a writable directory gets.
     pub state_path: Option<PathBuf>,
+    /// Alerts are not evaluated during this window after construction.
+    pub startup_grace: Duration,
 }
 
 /// The Orchestrator wires collectors, the alert engine, and notifiers
@@ -54,6 +56,9 @@ pub struct Orchestrator {
     maintenance: MaintenanceScheduler,
     executor: Box<dyn Executor>,
     state_path: Option<PathBuf>,
+    startup_grace: Duration,
+    started: Instant,
+    grace_announced: bool,
 }
 
 impl Orchestrator {
@@ -66,6 +71,9 @@ impl Orchestrator {
             maintenance: deps.maintenance,
             executor: deps.executor,
             state_path: deps.state_path,
+            startup_grace: deps.startup_grace,
+            started: Instant::now(),
+            grace_announced: false,
         }
     }
 
@@ -303,6 +311,22 @@ impl Orchestrator {
             return;
         }
 
+        // A host that just booted has its databases starting too, and reporting
+        // that transition means six messages (three critical, three recovered) for
+        // a condition that resolves itself. Evaluation is deferred rather than the
+        // dispatch: the tracker is left untouched, so the first cycle after the
+        // window sees the transition and a real outage is reported late, not lost.
+        if self.started.elapsed() < self.startup_grace {
+            if !self.grace_announced {
+                self.grace_announced = true;
+                info!(
+                    grace_secs = self.startup_grace.as_secs(),
+                    "Startup grace active: alerts deferred, collection continues"
+                );
+            }
+            return;
+        }
+
         // === Evaluate ===
         let mut events = Vec::new();
         for snapshot in &snapshots {
@@ -348,6 +372,9 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 mod tests {
     use super::*;
     use crate::alerts::engine::AlertEngine;
+    use crate::alerts::ThresholdRule;
+    use crate::collectors::CollectorError;
+    use crate::metrics::{MetricKind, MetricSnapshot};
     use crate::notifiers::NotifierError;
     use crate::services::maintenance::{
         BackupSettings, BackupTask, DailyTime, ExecutionError, ExecutionOutput, ExecutionRequest,
@@ -355,6 +382,28 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    /// A collector that always reports a value above the critical threshold.
+    struct HotCpu;
+
+    #[async_trait]
+    impl Collector for HotCpu {
+        fn name(&self) -> &str {
+            "cpu"
+        }
+
+        async fn collect(&self) -> Result<MetricSnapshot, CollectorError> {
+            Ok(MetricSnapshot::new(MetricKind::CpuUsage, 99.0))
+        }
+    }
+
+    fn hot_cpu_engine() -> AlertEngine {
+        AlertEngine::new(vec![ThresholdRule {
+            metric: MetricKind::CpuUsage,
+            warning: 80.0,
+            critical: 95.0,
+        }])
+    }
 
     /// A collector that outlives any reasonable shutdown deadline.
     ///
@@ -405,6 +454,7 @@ mod tests {
             .with_backup(backup.clone())]),
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
             state_path: Some(path.clone()),
+            startup_grace: Duration::ZERO,
         });
 
         let (_tx, mut rx) = watch::channel(false);
@@ -428,6 +478,7 @@ mod tests {
             .with_backup(backup)]),
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![])))),
             state_path: Some(path.clone()),
+            startup_grace: Duration::ZERO,
         });
 
         second.restore_state(Local::now().naive_local(), Instant::now());
@@ -455,6 +506,7 @@ mod tests {
             maintenance: MaintenanceScheduler::default(),
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
+            startup_grace: Duration::ZERO,
         });
 
         let (tx, rx) = watch::channel(false);
@@ -477,6 +529,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         outcomes: Arc<Mutex<Vec<MaintenanceOutcome>>>,
+        alerts: Arc<Mutex<usize>>,
     }
 
     #[async_trait]
@@ -486,6 +539,7 @@ mod tests {
         }
 
         async fn send(&self, _event: &crate::alerts::AlertEvent) -> Result<(), NotifierError> {
+            *self.alerts.lock().expect("lock") += 1;
             Ok(())
         }
 
@@ -544,6 +598,7 @@ mod tests {
             .with_backup(backup)]),
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure(), failure()])))),
             state_path: None,
+            startup_grace: Duration::ZERO,
         });
 
         (orchestrator, seen)
@@ -606,6 +661,7 @@ mod tests {
             maintenance: scheduler,
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
+            startup_grace: Duration::ZERO,
         });
 
         let (_tx, mut rx) = watch::channel(false);
@@ -614,6 +670,113 @@ mod tests {
         assert!(
             seen.lock().expect("lock").is_empty(),
             "a task that already ran today stays quiet"
+        );
+    }
+
+    /// A host that just booted has its databases starting too. Reporting that
+    /// transition sends six messages (three critical, three recovered) for a
+    /// condition that resolves itself, which is how a channel gets ignored.
+    #[tokio::test]
+    async fn alerts_are_not_dispatched_during_the_startup_grace() {
+        let recorder = Recorder::default();
+        let alerts = Arc::clone(&recorder.alerts);
+
+        let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: vec![Box::new(HotCpu)],
+            alert_engine: Box::new(hot_cpu_engine()),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::default(),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+            state_path: None,
+            startup_grace: Duration::from_secs(3600),
+        });
+
+        orchestrator.collect_and_alert().await;
+
+        assert_eq!(
+            *alerts.lock().expect("lock"),
+            0,
+            "nothing is dispatched inside the grace window"
+        );
+    }
+
+    /// The deferral must not swallow the alert: with no window, the same snapshot
+    /// is reported, which is what the first cycle after the window sees. This is
+    /// why the grace defers evaluation instead of filtering the dispatch.
+    #[tokio::test]
+    async fn the_same_alert_is_dispatched_once_the_grace_is_over() {
+        let recorder = Recorder::default();
+        let alerts = Arc::clone(&recorder.alerts);
+
+        let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: vec![Box::new(HotCpu)],
+            alert_engine: Box::new(hot_cpu_engine()),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::default(),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+            state_path: None,
+            startup_grace: Duration::ZERO,
+        });
+
+        orchestrator.collect_and_alert().await;
+
+        assert_eq!(
+            *alerts.lock().expect("lock"),
+            1,
+            "outside the window the transition is reported"
+        );
+    }
+
+    /// `DailyAt` is what production runs; the interval form had only ever been
+    /// exercised by the scheduler's own unit tests. This drives it end to end on a
+    /// real monotonic clock: due, run, recorded, and due again once it elapses.
+    #[tokio::test]
+    async fn an_interval_task_becomes_due_again_once_the_interval_elapses() {
+        let recorder = Recorder::default();
+        let seen = Arc::clone(&recorder.outcomes);
+
+        let backup = BackupTask::new(BackupSettings::new("host", 5432, "user", "db", "secret"));
+
+        let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: Vec::new(),
+            alert_engine: Box::new(AlertEngine::new(Vec::new())),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "por_intervalo",
+                TaskSchedule::Every(Duration::from_millis(30)),
+            )
+            .with_backup(backup)]),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure(), failure()])))),
+            state_path: None,
+            startup_grace: Duration::ZERO,
+        });
+
+        let (_tx, mut rx) = watch::channel(false);
+
+        orchestrator.maintain(&mut rx, 1).await;
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            1,
+            "the first cycle runs it"
+        );
+
+        orchestrator.maintain(&mut rx, 2).await;
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            1,
+            "the interval has not elapsed, so it is not due"
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        orchestrator.maintain(&mut rx, 3).await;
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            2,
+            "past the interval it is due again"
         );
     }
 }

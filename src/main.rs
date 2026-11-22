@@ -151,6 +151,7 @@ fn main() -> Result<()> {
         poll_interval,
         maintenance,
         executor: Box::new(ProcessExecutor::new()),
+        startup_grace: std::time::Duration::from_secs(config.daemon.startup_grace_secs),
         state_path: config
             .maintenance
             .state_path

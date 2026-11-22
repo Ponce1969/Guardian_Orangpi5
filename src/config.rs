@@ -162,6 +162,18 @@ fn default_verify_timeout_secs() -> u64 {
 pub struct DaemonConfig {
     /// Seconds between each collection cycle.
     pub poll_interval_secs: u64,
+    /// How long after start-up alerts are not evaluated.
+    ///
+    /// A host that just booted has PostgreSQL containers that are not answering
+    /// yet, and reporting them every time trains the operator to ignore the
+    /// channel. The window is bounded and it defers evaluation instead of
+    /// discarding it, so an outage still present when it ends is reported.
+    #[serde(default = "default_startup_grace_secs")]
+    pub startup_grace_secs: u64,
+}
+
+fn default_startup_grace_secs() -> u64 {
+    180
 }
 
 /// Default network warning threshold in MB/s.

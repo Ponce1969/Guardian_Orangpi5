@@ -5,6 +5,10 @@
 
 daemon:
   poll_interval_secs: 30
+  # After a host reboot the databases are still starting. Alerts are not evaluated
+  # during this window; collection continues, and a real outage is reported when it
+  # ends rather than lost.
+  startup_grace_secs: 180
 
 thresholds:
   cpu_warning: 80
