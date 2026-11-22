@@ -243,11 +243,42 @@ where
             }
             // A pipe that cannot be read any further ends the capture; the
             // process outcome is what the caller acts on.
+            // A retried read is not a broken pipe; only real errors end the capture.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
 
     bounded_text(&buffer, max_bytes)
+}
+
+/// Collect both capture tasks, but never for longer than `deadline`.
+///
+/// `read_bounded` stops only at EOF, and a descendant that inherited the pipe
+/// write end keeps it open after the direct child is gone. Awaiting the readers
+/// without a bound therefore lets a stray grandchild decide when `run` returns,
+/// which is exactly the deadline the caller asked for and did not get.
+async fn drain_capture(
+    mut stdout_task: tokio::task::JoinHandle<String>,
+    mut stderr_task: tokio::task::JoinHandle<String>,
+    deadline: Duration,
+) -> (String, String) {
+    let read = async {
+        let stdout = (&mut stdout_task).await.unwrap_or_default();
+        let stderr = (&mut stderr_task).await.unwrap_or_default();
+        (stdout, stderr)
+    };
+    let outcome = tokio::time::timeout(deadline, read).await;
+    match outcome {
+        Ok(captured) => captured,
+        Err(_) => {
+            // The pipe is still held open somewhere we no longer control. Stop
+            // waiting and stop the readers rather than leaking them.
+            stdout_task.abort();
+            stderr_task.abort();
+            (String::new(), String::new())
+        }
+    }
 }
 
 /// Signal an entire process group.
@@ -279,11 +310,11 @@ async fn terminate(child: &mut Child, pid: Option<u32>, grace: Duration) {
 
         signal_group(pid, libc::SIGTERM);
 
-        if tokio::time::timeout(grace, child.wait()).await.is_ok() {
-            return;
-        }
-
-        // The grace window elapsed without an exit: take the group down.
+        // The grace window decides how long the group gets to leave politely; it
+        // never decides whether the group is signalled at all. A direct child that
+        // exits on SIGTERM proves nothing about its descendants: one that ignores
+        // SIGTERM would keep running while `run` reports a timeout.
+        let _ = tokio::time::timeout(grace, child.wait()).await;
         signal_group(pid, libc::SIGKILL);
         let _ = child.wait().await;
     }
@@ -401,9 +432,9 @@ impl Executor for ProcessExecutor {
                 }
             };
 
-        // Killing the group closes every pipe, so these finish promptly.
-        let stdout = stdout_task.await.unwrap_or_default();
-        let stderr = stderr_task.await.unwrap_or_default();
+        // The child is reaped, but a descendant may still hold a pipe write end
+        // open; the drain is bounded so that `run` cannot outlive its deadline.
+        let (stdout, stderr) = drain_capture(stdout_task, stderr_task, request.grace()).await;
 
         // The child is reaped; nothing is left for the guard to kill.
         group_guard.disarm();
@@ -647,5 +678,23 @@ mod tests {
         let buffer = [0xFF_u8, 0xFE, b'a', b'b'];
 
         assert_eq!(bounded_text(&buffer, 100), "ab");
+    }
+
+    /// A reader that never finishes must not extend the run: the deadline belongs
+    /// to the caller, not to whatever still holds the pipe open.
+    #[tokio::test]
+    async fn capture_drains_within_the_deadline_even_if_a_reader_never_ends() {
+        let stdout_task = tokio::spawn(std::future::pending::<String>());
+        let stderr_task = tokio::spawn(std::future::pending::<String>());
+
+        let bounded = tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_capture(stdout_task, stderr_task, Duration::from_millis(50)),
+        )
+        .await;
+
+        let (stdout, stderr) =
+            bounded.expect("drain_capture never returned: the readers are unbounded");
+        assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
     }
 }
