@@ -51,6 +51,21 @@ pub fn backup_filename(database: &str, now: NaiveDateTime) -> String {
     )
 }
 
+/// Whether `name` is a backup of exactly `database`.
+///
+/// The name is rebuilt from the timestamp it carries instead of being prefix-matched.
+/// A prefix makes the backups of `foo-bar` look like `foo`'s, because
+/// `guardianrs-foo-bar-<ts>.dump` starts with `guardianrs-foo-`, and retention for the
+/// shorter name would then delete a sibling database's dumps once the limit is
+/// exceeded. Rebuilding cannot collide: the name either equals the one this database
+/// would produce for that timestamp, or it does not.
+pub fn belongs_to_database(name: &str, database: &str) -> bool {
+    match timestamp_of(name) {
+        Some(when) => backup_filename(database, when) == name,
+        None => false,
+    }
+}
+
 /// Read the timestamp back out of a backup name.
 ///
 /// The timestamp is a fixed-width suffix, so a database name containing dashes

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 
-use super::backup::{backup_prefix, backups_to_prune, plan_dump, redact, BackupSettings};
+use super::backup::{backups_to_prune, belongs_to_database, plan_dump, redact, BackupSettings};
 use super::executor::{ExecutionError, ExecutionOutput, Executor};
 use super::outcome::{classify_execution, summarize, MaintenanceOutcome, MaintenanceStatus};
 
@@ -185,14 +185,13 @@ impl BackupTask {
         let entries = std::fs::read_dir(&self.destination)
             .map_err(|error| format!("cannot list {}: {error}", self.destination.display()))?;
 
-        let prefix = backup_prefix(&self.settings.database);
-
         let mut names = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 // Only this database's files: the destination is shared, so pruning
                 // the whole directory would let one project evict another's backup.
-                if name.starts_with(&prefix) {
+                // Matching rebuilds the name rather than comparing prefixes.
+                if belongs_to_database(name, &self.settings.database) {
                     names.push(name.to_string());
                 }
             }
@@ -552,6 +551,67 @@ mod tests {
             names.iter().filter(|name| name.contains("-uno-")).count(),
             1,
             "this database keeps only the newest: {names:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `uno-2`'s file name starts with `uno`'s prefix, so a plain prefix check makes
+    /// the shorter database's retention count — and delete — the longer one's dumps.
+    /// The names that exist today do not collide, which is exactly why this has to be
+    /// pinned: the bug is latent, not absent.
+    #[test]
+    fn pruning_a_database_ignores_one_whose_name_extends_it() {
+        let dir = scratch_dir("colliding-names");
+
+        let moment = |hour: u32| {
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .and_then(|date| date.and_hms_opt(hour, 0, 0))
+                .expect("valid timestamp")
+        };
+
+        for hour in [1, 2] {
+            for database in ["uno", "uno-2"] {
+                std::fs::write(
+                    dir.join(super::super::backup::backup_filename(
+                        database,
+                        moment(hour),
+                    )),
+                    b"dump",
+                )
+                .expect("write");
+            }
+        }
+
+        let task = BackupTask {
+            settings: super::super::backup::BackupSettings::new(
+                "host", 5432, "user", "uno", "secret",
+            ),
+            destination: dir.clone(),
+            keep_backups: 1,
+            timeout: std::time::Duration::from_secs(10),
+            grace: std::time::Duration::from_secs(1),
+            verify_timeout: std::time::Duration::from_secs(10),
+        };
+
+        let pruned = task.prune().expect("prune works");
+
+        assert_eq!(
+            pruned, 1,
+            "only uno's older dump is over the limit; uno-2's two are not uno's business"
+        );
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names.iter().filter(|name| name.contains("-uno-2-")).count(),
+            2,
+            "the database whose name extends the other keeps both dumps: {names:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
