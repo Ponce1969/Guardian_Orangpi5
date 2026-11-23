@@ -427,14 +427,15 @@ mod tests {
         }
     }
 
-    /// The regression this whole module exists for: a restart used to re-run a
-    /// due task, because the scheduler only remembered in memory. Two orchestrators
-    /// share one state file and the second must stay quiet.
+    /// A failure is not a completed run, so a restart must retry it. Before the state
+    /// file existed a restart cleared the record and the next poll ran the task again;
+    /// remembering a failure removed the only retry a wedged backup gets until the
+    /// next scheduled slot.
     ///
     /// The schedule is an hour-long interval rather than a daily time so the test
     /// does not depend on what time it is when it runs.
     #[tokio::test]
-    async fn a_restart_does_not_repeat_a_task_that_already_ran() {
+    async fn a_restart_retries_a_task_whose_last_run_failed() {
         let mut dir = std::env::temp_dir();
         dir.push(format!("guardian-restart-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch directory");
@@ -460,7 +461,7 @@ mod tests {
         let (_tx, mut rx) = watch::channel(false);
         first.maintain(&mut rx, 1).await;
 
-        assert!(path.exists(), "the finished run is recorded on disk");
+        assert!(path.exists(), "the state file is still written");
 
         // A new process: fresh scheduler, same record on disk.
         let recorder = Recorder::default();
@@ -485,8 +486,8 @@ mod tests {
         second.maintain(&mut rx, 1).await;
 
         assert!(
-            seen.lock().expect("lock").is_empty(),
-            "a task that ran before the restart is not due again"
+            !seen.lock().expect("lock").is_empty(),
+            "a failed run is retried after a restart"
         );
 
         std::fs::remove_dir_all(&dir).ok();

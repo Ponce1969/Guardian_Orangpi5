@@ -14,6 +14,7 @@
 //! would cost all monitoring, so a missing file is normal and an unreadable one is
 //! a warning rather than an error the caller must handle.
 
+use std::io::Write;
 use std::path::Path;
 
 use chrono::{NaiveDateTime, TimeDelta};
@@ -131,15 +132,21 @@ pub fn save(path: &Path, state: &MaintenanceState) -> Result<(), String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
 
-    // Written beside the target and renamed onto it: an interrupted write leaves a
-    // stale record rather than a truncated one, and a truncated file would read as
-    // corrupt exactly when the record matters most.
+    // Written beside the target, flushed and synced, and only then renamed: a
+    // rename that reaches the disk ahead of the data it names leaves a zero-length
+    // record, which reads as corrupt exactly when the record matters most.
     let temp = path.with_extension("json.tmp");
 
-    std::fs::write(&temp, body)
+    let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
+    file.write_all(body.as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot flush {}: {error}", temp.display()))?;
+    drop(file);
 
     if std::fs::rename(&temp, path).is_ok() {
+        sync_parent(path);
         return Ok(());
     }
 
@@ -148,8 +155,24 @@ pub fn save(path: &Path, state: &MaintenanceState) -> Result<(), String> {
     let _ = std::fs::remove_file(path);
 
     std::fs::rename(&temp, path)
-        .map_err(|error| format!("cannot replace {}: {error}", path.display()))
+        .map_err(|error| format!("cannot replace {}: {error}", path.display()))?;
+    sync_parent(path);
+    Ok(())
 }
+
+/// Flush the directory entry too, so the rename itself survives a power loss.
+#[cfg(unix)]
+fn sync_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
+/// Windows exposes no directory handle to flush; the file sync above is all there is.
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -287,5 +310,27 @@ mod tests {
             .expect("the task has run");
 
         assert_eq!(elapsed, TimeDelta::zero());
+    }
+
+    /// The record is published through a temp file: a crash mid-write must leave
+    /// the previous record intact rather than a truncated one.
+    #[test]
+    fn save_publishes_through_a_temp_file_and_leaves_none_behind() {
+        let dir = std::env::temp_dir().join(format!("guardian-state-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("state.json");
+
+        save(&path, &MaintenanceState::new(Vec::new())).expect("save works");
+
+        assert!(path.exists(), "the record was not published");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file survived the rename"
+        );
+        let body = std::fs::read_to_string(&path).expect("read back");
+        serde_json::from_str::<serde_json::Value>(&body)
+            .expect("the published record is valid JSON");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

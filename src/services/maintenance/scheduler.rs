@@ -162,6 +162,10 @@ impl MaintenanceScheduler {
         let tasks = self
             .tasks
             .iter()
+            // Only a proven run is remembered. Persisting a failure would hide the
+            // retry that a restart used to provide: before this file existed, a
+            // restart cleared the record and the next poll ran the task again.
+            .filter(|task| task.last_status == Some(MaintenanceStatus::Success))
             .filter_map(|task| {
                 task.last_run_wall.map(|last_run| TaskState {
                     name: task.name.clone(),
@@ -448,5 +452,29 @@ mod tests {
         scheduler.record(0, MaintenanceStatus::Failed, at(1, 3, 0), now);
 
         assert!(scheduler.record(0, MaintenanceStatus::Success, at(2, 3, 0), now));
+    }
+
+    /// A restart used to be the only way to retry a failed backup, so a failure
+    /// must not be remembered as a finished run.
+    #[test]
+    fn a_failed_run_is_not_remembered() {
+        let mut scheduler = MaintenanceScheduler::new(vec![ScheduledTask::new(
+            "backup",
+            TaskSchedule::DailyAt(daily(3, 30)),
+        )]);
+
+        scheduler.record(0, MaintenanceStatus::Failed, at(1, 3, 30), mono());
+        assert_eq!(
+            scheduler.export_state().len(),
+            0,
+            "a failed run must stay due after a restart"
+        );
+
+        scheduler.record(0, MaintenanceStatus::Success, at(1, 3, 31), mono());
+        assert_eq!(
+            scheduler.export_state().len(),
+            1,
+            "a successful run is remembered"
+        );
     }
 }
