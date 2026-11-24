@@ -212,6 +212,7 @@ impl Orchestrator {
             task = %outcome.task,
             status = %outcome.status,
             duration_secs = outcome.duration.as_secs(),
+            detail = %outcome.detail,
             "Maintenance run finished"
         );
 

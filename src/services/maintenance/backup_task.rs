@@ -92,7 +92,7 @@ impl BackupTask {
                     started,
                     MaintenanceStatus::Skipped,
                     None,
-                    &format!("pg_dump is unavailable: {reason}"),
+                    &self.redact_detail(format!("pg_dump is unavailable: {reason}")),
                 );
             }
             Err(ExecutionError::Collect { reason }) => {
@@ -101,7 +101,9 @@ impl BackupTask {
                     started,
                     MaintenanceStatus::Failed,
                     None,
-                    &format!("the dump process could not be collected: {reason}"),
+                    &self.redact_detail(format!(
+                        "the dump process could not be collected: {reason}"
+                    )),
                 );
             }
         };
@@ -136,7 +138,9 @@ impl BackupTask {
                     started,
                     MaintenanceStatus::Failed,
                     None,
-                    &format!("the backup cannot be verified, pg_restore is unavailable: {reason}"),
+                    &self.redact_detail(format!(
+                        "the backup cannot be verified, pg_restore is unavailable: {reason}"
+                    )),
                 );
             }
             Err(ExecutionError::Collect { reason }) => {
@@ -145,7 +149,9 @@ impl BackupTask {
                     started,
                     MaintenanceStatus::Failed,
                     None,
-                    &format!("the verification process could not be collected: {reason}"),
+                    &self.redact_detail(format!(
+                        "the verification process could not be collected: {reason}"
+                    )),
                 );
             }
         };
@@ -176,7 +182,7 @@ impl BackupTask {
                     started,
                     MaintenanceStatus::Failed,
                     None,
-                    &format!("the dump data cannot be read: {reason}"),
+                    &self.redact_detail(format!("the dump data cannot be read: {reason}")),
                 );
             }
         };
@@ -214,6 +220,14 @@ impl BackupTask {
         };
 
         self.outcome(started, MaintenanceStatus::Success, Some(0), &detail)
+    }
+
+    /// Redact a detail built from a raw executor reason.
+    ///
+    /// These details now reach the journal on every run, so a reason that echoes
+    /// the child environment must not carry the password with it.
+    fn redact_detail(&self, detail: String) -> String {
+        redact(&detail, self.settings.password())
     }
 
     /// Bounded, single-line, secret-free text for the outcome.
@@ -734,6 +748,29 @@ mod tests {
             !current.partial.exists() && !current.restore_temp.exists(),
             "a failed run left its scratch files behind"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The detail now reaches the journal on every run, so a spawn reason that echoes
+    /// the child environment must not carry the password with it.
+    #[tokio::test]
+    async fn a_spawn_error_never_leaks_the_password() {
+        let dir = scratch_dir("redact-spawn");
+        let task = task_in(&dir, 7);
+        let (executor, _) = executor_with(vec![Err(ExecutionError::Spawn {
+            program: "pg_dump".to_string(),
+            reason: "could not run with PGPASSWORD=s3cret".to_string(),
+        })]);
+
+        let outcome = task.run(&executor, now()).await;
+
+        assert_eq!(outcome.status, MaintenanceStatus::Skipped);
+        assert!(
+            !outcome.detail.contains("s3cret"),
+            "the password leaked through a spawn error: {}",
+            outcome.detail
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
