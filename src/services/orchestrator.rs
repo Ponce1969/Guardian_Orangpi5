@@ -180,6 +180,11 @@ impl Orchestrator {
                 tokio::pin!(run);
 
                 tokio::select! {
+                    // Polled first on purpose. `select!` chooses randomly among ready
+                    // branches, so a run that finishes on the same poll as the signal
+                    // could be discarded: the dump exists, nothing records it, and the
+                    // log claims it was cancelled. A finished outcome always wins.
+                    biased;
                     outcome = &mut run => outcome,
                     _ = wait_for_shutdown(&mut *shutdown) => {
                         // Dropping `run` fires the executor's group guard, so the
@@ -193,13 +198,22 @@ impl Orchestrator {
                     }
                 }
             }
-            None => MaintenanceOutcome {
-                task: name.clone(),
-                status: MaintenanceStatus::Skipped,
-                exit_code: None,
-                duration: Duration::ZERO,
-                detail: "no runnable implementation for this task kind".to_string(),
-            },
+            None => {
+                // Recorded as skipped so it does not retry every tick, but loud: a
+                // task kind with no implementation is a configuration error, and
+                // recording it silently hid that for a whole interval.
+                warn!(
+                    task = %name,
+                    "A task kind with no runnable implementation is recorded as skipped"
+                );
+                MaintenanceOutcome {
+                    task: name.clone(),
+                    status: MaintenanceStatus::Skipped,
+                    exit_code: None,
+                    duration: Duration::ZERO,
+                    detail: "no runnable implementation for this task kind".to_string(),
+                }
+            }
         };
 
         let should_announce = self
@@ -780,5 +794,54 @@ mod tests {
             2,
             "past the interval it is due again"
         );
+    }
+
+    /// `select!` chooses randomly among ready branches. If a run finishes on the same
+    /// poll as the shutdown signal, the finished backup could be discarded: the file
+    /// exists, nothing records it, and the log says it was cancelled.
+    #[tokio::test]
+    async fn a_run_that_finishes_as_shutdown_arrives_is_still_recorded() {
+        // Without the ordered poll this pass rate would be 2^-20; with it, every run wins.
+        for attempt in 0..20 {
+            let dir = std::env::temp_dir().join(format!(
+                "guardian-shutdown-race-{}-{attempt}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+
+            let mut backup =
+                BackupTask::new(BackupSettings::new("host", 5432, "user", "db", "secret"));
+            backup.destination = dir.clone();
+
+            let recorder = Recorder::default();
+            let seen = Arc::clone(&recorder.outcomes);
+
+            let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+                collectors: Vec::new(),
+                alert_engine: Box::new(AlertEngine::new(Vec::new())),
+                notifiers: vec![Box::new(recorder)],
+                poll_interval: Duration::from_secs(30),
+                maintenance: MaintenanceScheduler::new(vec![ScheduledTask::new(
+                    "postgres_backup",
+                    TaskSchedule::Every(Duration::from_secs(3600)),
+                )
+                .with_backup(backup)]),
+                executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
+                state_path: None,
+                startup_grace: Duration::ZERO,
+            });
+
+            // Requested already, so the signal branch is ready on the first poll,
+            // together with the run that completes immediately.
+            let (_tx, mut rx) = watch::channel(true);
+            orchestrator.maintain(&mut rx, 1).await;
+
+            assert!(
+                !seen.lock().expect("lock").is_empty(),
+                "a completed run was discarded when the shutdown signal arrived"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }
