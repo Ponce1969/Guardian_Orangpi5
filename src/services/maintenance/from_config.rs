@@ -218,12 +218,11 @@ postgres:
         result
     }
 
-    /// A task that names its own server takes nothing from the shared block, so
-    /// the migrations between databases stay independent.
+    /// A task names the instance it backs up. The per-task connection keys this
+    /// schema used to carry are gone, and an unknown key is a parse error now: this
+    /// fixture kept writing them and only passed because they were dropped in silence.
     #[test]
-    fn a_task_can_carry_its_own_connection() {
-        std::env::set_var("GUARDIAN_TEST_AUDITOR_PW", "another-secret");
-
+    fn a_task_selects_its_instance() {
         let yaml = r#"
 maintenance:
   enabled: true
@@ -232,16 +231,12 @@ maintenance:
       kind: postgres_backup
       instance: principal
       daily_at: "03:30"
-      host: 127.0.0.1
-      port: 5442
-      user: Gallinal2218
       database: auditor_familiar
-      password_env: GUARDIAN_TEST_AUDITOR_PW
 "#;
         let config = loaded(yaml).expect("valid configuration");
 
         let tasks = scheduled_tasks(&config.maintenance.tasks, &config.postgres)
-            .expect("a task with its own connection is valid");
+            .expect("a task naming an instance is valid");
 
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].backup.is_some());

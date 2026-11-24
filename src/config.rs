@@ -77,6 +77,7 @@ impl Default for DockerConfig {
 /// `services::maintenance::from_config`, which is the one place allowed to know
 /// both the configuration types and the task types.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceConfig {
     /// Whether the scheduler runs at all.
     #[serde(default)]
@@ -99,6 +100,7 @@ pub struct MaintenanceConfig {
 /// and where the file goes. Writing the credentials twice would create a second
 /// place to keep in sync and a second place to leak.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceTaskConfig {
     pub name: String,
     /// The operation to run. Unknown kinds are a startup error, never a silent
@@ -723,5 +725,31 @@ maintenance:
         assert!(error.to_string().contains("fantasma"), "error was: {error}");
 
         std::env::remove_var(VAR);
+    }
+
+    /// A misspelled key under `maintenance` used to be swallowed: the daemon logged
+    /// "Maintenance scheduled" and ran no backups at all, for as long as nobody looked.
+    #[test]
+    fn a_misspelled_maintenance_key_is_a_parse_error() {
+        let yaml = format!(
+            "{LEGACY_YAML}
+maintenance:
+  enabled: true
+  task:
+    - name: backup
+      kind: postgres_backup
+      daily_at: \"03:30\"
+      database: db
+"
+        );
+
+        let error = serde_yaml::from_str::<GuardianConfig>(&yaml)
+            .expect_err("a misspelled tasks key must not be ignored");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("task"),
+            "the error must name the offending key, got: {message}"
+        );
     }
 }
