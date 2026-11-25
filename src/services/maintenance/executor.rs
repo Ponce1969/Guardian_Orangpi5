@@ -52,6 +52,7 @@ pub struct ExecutionRequest {
     timeout: Duration,
     grace: Duration,
     cwd: Option<PathBuf>,
+    capture_stdout: bool,
 }
 
 impl ExecutionRequest {
@@ -67,6 +68,7 @@ impl ExecutionRequest {
             timeout,
             grace: Duration::from_secs(5),
             cwd: None,
+            capture_stdout: true,
         }
     }
 
@@ -88,6 +90,15 @@ impl ExecutionRequest {
     /// Run the command in a specific working directory.
     pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
         self.cwd = Some(cwd);
+        self
+    }
+
+    /// Send standard output directly to the OS null device instead of piping it.
+    ///
+    /// Used when a verification command (`pg_restore --file -`) streams full
+    /// archive contents only to prove decompression succeeds (`I4.1`).
+    pub fn with_discarded_stdout(mut self) -> Self {
+        self.capture_stdout = false;
         self
     }
 
@@ -114,6 +125,10 @@ impl ExecutionRequest {
     pub fn cwd(&self) -> Option<&PathBuf> {
         self.cwd.as_ref()
     }
+
+    pub fn captures_stdout(&self) -> bool {
+        self.capture_stdout
+    }
 }
 
 /// Debug output lists environment *keys* and never values.
@@ -132,6 +147,7 @@ impl fmt::Debug for ExecutionRequest {
             .field("timeout", &self.timeout)
             .field("grace", &self.grace)
             .field("cwd", &self.cwd)
+            .field("capture_stdout", &self.capture_stdout)
             .finish()
     }
 }
@@ -387,11 +403,17 @@ impl Executor for ProcessExecutor {
     async fn run(&self, request: &ExecutionRequest) -> Result<ExecutionOutput, ExecutionError> {
         let mut command = Command::new(request.program());
 
+        let stdout_cfg = if request.captures_stdout() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+
         command
             .args(request.args())
             .envs(request.env().iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(stdout_cfg)
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 

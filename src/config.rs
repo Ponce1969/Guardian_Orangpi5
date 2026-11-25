@@ -405,6 +405,179 @@ impl<'de> Deserialize<'de> for DiscordConfig {
     }
 }
 
+const ALLOWED_DISCORD_HOSTS: &[&str] = &[
+    "discord.com",
+    "discordapp.com",
+    "ptb.discord.com",
+    "canary.discord.com",
+    "ptb.discordapp.com",
+    "canary.discordapp.com",
+];
+
+fn validate_safe_identifier(field: &str, value: &str) -> Result<(), ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid {
+            details: format!("{field} must not be empty"),
+        });
+    }
+    if value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigError::Invalid {
+            details: format!(
+                "{field} {:?} must not contain path separators, '..' or control characters",
+                value
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_threshold_pair(
+    name: &str,
+    warning: f64,
+    critical: f64,
+    is_percentage: bool,
+    allow_negative: bool,
+) -> Result<(), ConfigError> {
+    if !warning.is_finite() || !critical.is_finite() {
+        return Err(ConfigError::Invalid {
+            details: format!("{name} thresholds must be finite numbers"),
+        });
+    }
+    if !allow_negative && (warning < 0.0 || critical < 0.0) {
+        return Err(ConfigError::Invalid {
+            details: format!("{name} thresholds must be non-negative"),
+        });
+    }
+    if is_percentage && (warning > 100.0 || critical > 100.0) {
+        return Err(ConfigError::Invalid {
+            details: format!("{name} percentage thresholds must not exceed 100"),
+        });
+    }
+    if warning >= critical {
+        return Err(ConfigError::Invalid {
+            details: format!(
+                "{name} warning threshold ({warning}) must be strictly less than critical ({critical})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_thresholds(thresholds: &ThresholdsConfig) -> Result<(), ConfigError> {
+    validate_threshold_pair(
+        "cpu",
+        thresholds.cpu_warning,
+        thresholds.cpu_critical,
+        true,
+        false,
+    )?;
+    validate_threshold_pair(
+        "memory",
+        thresholds.memory_warning,
+        thresholds.memory_critical,
+        true,
+        false,
+    )?;
+    validate_threshold_pair(
+        "disk",
+        thresholds.disk_warning,
+        thresholds.disk_critical,
+        true,
+        false,
+    )?;
+    validate_threshold_pair(
+        "temperature",
+        thresholds.temp_warning,
+        thresholds.temp_critical,
+        false,
+        true,
+    )?;
+    validate_threshold_pair(
+        "network",
+        thresholds.network_warning,
+        thresholds.network_critical,
+        false,
+        false,
+    )?;
+    validate_threshold_pair(
+        "docker_unhealthy",
+        thresholds.docker_unhealthy_warning,
+        thresholds.docker_unhealthy_critical,
+        false,
+        false,
+    )?;
+    validate_threshold_pair(
+        "docker_disk",
+        thresholds.docker_disk_warning,
+        thresholds.docker_disk_critical,
+        false,
+        false,
+    )?;
+    validate_threshold_pair(
+        "postgres_failures",
+        thresholds.postgres_failures_warning,
+        thresholds.postgres_failures_critical,
+        false,
+        false,
+    )?;
+    Ok(())
+}
+
+fn validate_discord_webhook_url(raw: &str) -> Result<String, ConfigError> {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix("https://") else {
+        return Err(ConfigError::Invalid {
+            details: "Discord webhook URL must start with https://".to_string(),
+        });
+    };
+
+    let Some((host, path_and_query)) = rest.split_once('/') else {
+        return Err(ConfigError::Invalid {
+            details: "Discord webhook URL is missing its path".to_string(),
+        });
+    };
+
+    let host_lower = host.to_ascii_lowercase();
+    if !ALLOWED_DISCORD_HOSTS.contains(&host_lower.as_str()) {
+        return Err(ConfigError::Invalid {
+            details: format!(
+                "Discord webhook host {:?} is not an official discord.com/discordapp.com endpoint",
+                host
+            ),
+        });
+    }
+
+    let path = path_and_query.split(['?', '#']).next().unwrap_or("");
+    let Some(segments) = path.strip_prefix("api/webhooks/") else {
+        return Err(ConfigError::Invalid {
+            details: "Discord webhook URL path must begin with /api/webhooks/<id>/<token>"
+                .to_string(),
+        });
+    };
+
+    let mut parts = segments.split('/');
+    let id = parts.next().unwrap_or("");
+    let token = parts.next().unwrap_or("");
+    if id.is_empty()
+        || token.is_empty()
+        || parts.next().is_some()
+        || id.chars().any(char::is_whitespace)
+        || token.chars().any(char::is_whitespace)
+    {
+        return Err(ConfigError::Invalid {
+            details: "Discord webhook URL must carry non-empty /api/webhooks/<id>/<token> segments"
+                .to_string(),
+        });
+    }
+
+    Ok(trimmed.to_string())
+}
+
 /// Load configuration from a YAML file, then resolve secrets from environment variables.
 ///
 /// # Errors
@@ -425,15 +598,24 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
             details: e.to_string(),
         })?;
 
+    if config.daemon.poll_interval_secs == 0 {
+        return Err(ConfigError::Invalid {
+            details: "daemon.poll_interval_secs must be greater than zero".to_string(),
+        });
+    }
+
+    validate_thresholds(&config.thresholds)?;
+
     // Resolve secrets from environment variables
     if config.notification.discord.enabled {
         let env_var = &config.notification.discord.webhook_url_env;
         let url = env::var(env_var).map_err(|_| ConfigError::MissingEnv {
             var: env_var.clone(),
         })?;
+        let validated = validate_discord_webhook_url(&url)?;
         // Store the resolved URL inside the config for internal use.
         // This avoids repeated env lookups during dispatch.
-        config.notification.discord.resolved_webhook_url = Some(url);
+        config.notification.discord.resolved_webhook_url = Some(validated);
     }
 
     // The password follows the same contract as the webhook: the file carries
@@ -449,9 +631,14 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
         let mut names: HashSet<String> = HashSet::new();
 
         for instance in &mut config.postgres.instances {
-            if instance.name.trim().is_empty() {
+            validate_safe_identifier("postgres instance name", &instance.name)?;
+            validate_safe_identifier("postgres instance database", &instance.database)?;
+            if instance.connect_timeout_secs == 0 {
                 return Err(ConfigError::Invalid {
-                    details: "every postgres instance needs a name".to_string(),
+                    details: format!(
+                        "postgres instance {:?}: connect_timeout_secs must be greater than zero",
+                        instance.name
+                    ),
                 });
             }
 
@@ -486,6 +673,10 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
             .collect();
 
         for task in &config.maintenance.tasks {
+            validate_safe_identifier("maintenance task name", &task.name)?;
+            if let Some(database) = &task.database {
+                validate_safe_identifier("maintenance task database", database)?;
+            }
             if !declared.contains(task.instance.as_str()) {
                 return Err(ConfigError::Invalid {
                     details: format!(
@@ -831,5 +1022,83 @@ postgres:
             "Debug leaked Postgres password: {rendered}"
         );
         assert!(rendered.contains("auditor"));
+    }
+
+    #[test]
+    fn zero_poll_interval_is_rejected() {
+        let yaml = LEGACY_YAML.replace("poll_interval_secs: 30", "poll_interval_secs: 0");
+
+        let error = load_from_temp(&yaml).expect_err("zero poll interval panics tokio::time");
+
+        assert!(
+            error.to_string().contains("poll_interval_secs"),
+            "error was: {error}"
+        );
+    }
+
+    #[test]
+    fn inverted_or_non_finite_thresholds_are_rejected() {
+        let inverted = LEGACY_YAML
+            .replace("cpu_warning: 80", "cpu_warning: 95")
+            .replace("cpu_critical: 95", "cpu_critical: 80");
+        assert!(load_from_temp(&inverted).is_err());
+
+        let over_hundred = LEGACY_YAML.replace("disk_critical: 90", "disk_critical: 120");
+        assert!(load_from_temp(&over_hundred).is_err());
+
+        let nan_yaml = LEGACY_YAML.replace("memory_warning: 85", "memory_warning: .nan");
+        assert!(load_from_temp(&nan_yaml).is_err());
+    }
+
+    #[test]
+    fn path_separators_in_database_or_instance_are_rejected() {
+        const VAR: &str = "GUARDIAN_TEST_PATH_SAFE_PG";
+        std::env::set_var(VAR, "s3cret");
+
+        let traversal_db = format!(
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: auditor\n      host: 127.0.0.1\n      port: 5432\n      database: ../etc/passwd\n      user: guardian\n      password_env: {VAR}\n"
+        );
+        assert!(load_from_temp(&traversal_db).is_err());
+
+        let slash_instance = format!(
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: bad/name\n      host: 127.0.0.1\n      port: 5432\n      database: auditor\n      user: guardian\n      password_env: {VAR}\n"
+        );
+        assert!(load_from_temp(&slash_instance).is_err());
+
+        std::env::remove_var(VAR);
+    }
+
+    #[test]
+    fn webhook_url_rejects_non_https_or_foreign_hosts() {
+        const VAR: &str = "GUARDIAN_TEST_WEBHOOK_VALIDATION";
+        let enabled_yaml = LEGACY_YAML.replace(
+            "enabled: false\n    webhook_url_env: DISCORD_WEBHOOK_URL",
+            &format!("enabled: true\n    webhook_url_env: {VAR}"),
+        );
+
+        for invalid in [
+            "http://discord.com/api/webhooks/123/token",
+            "https://evil.example.com/api/webhooks/123/token",
+            "https://discord.com/api/webhooks/123/",
+            "https://discord.com/other/path",
+        ] {
+            std::env::set_var(VAR, invalid);
+            assert!(
+                load_from_temp(&enabled_yaml).is_err(),
+                "expected invalid webhook URL {invalid:?} to fail"
+            );
+        }
+
+        std::env::set_var(
+            VAR,
+            "  https://discord.com/api/webhooks/123456789/valid-token  ",
+        );
+        let loaded = load_from_temp(&enabled_yaml).expect("valid Discord webhook URL loads");
+        assert_eq!(
+            loaded.notification.discord.webhook_url().ok(),
+            Some("https://discord.com/api/webhooks/123456789/valid-token")
+        );
+
+        std::env::remove_var(VAR);
     }
 }

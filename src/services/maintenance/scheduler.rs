@@ -60,8 +60,9 @@ impl ScheduledTask {
         }
     }
 
-    /// Attach the payload this task runs.
-    pub fn with_backup(mut self, backup: super::backup_task::BackupTask) -> Self {
+    /// Attach the payload this task runs, synchronizing its reported task name.
+    pub fn with_backup(mut self, mut backup: super::backup_task::BackupTask) -> Self {
+        backup.task_name = self.name.clone();
         self.backup = Some(backup);
         self
     }

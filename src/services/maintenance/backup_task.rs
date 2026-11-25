@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDateTime;
 
 use super::backup::{
-    backups_to_prune, belongs_to_database, plan_dump, redact, BackupPlan, BackupSettings,
+    backups_to_prune, belongs_to_database, belongs_to_database_partial, plan_dump, redact,
+    BackupPlan, BackupSettings,
 };
 use super::executor::{ExecutionError, ExecutionOutput, Executor};
 use super::outcome::{classify_execution, summarize, MaintenanceOutcome, MaintenanceStatus};
@@ -34,6 +35,7 @@ pub const DEFAULT_KEEP_BACKUPS: usize = 7;
 /// A configured backup task.
 #[derive(Debug, Clone)]
 pub struct BackupTask {
+    pub task_name: String,
     pub settings: BackupSettings,
     pub destination: PathBuf,
     pub keep_backups: usize,
@@ -43,9 +45,10 @@ pub struct BackupTask {
 }
 
 impl BackupTask {
-    /// A task with the documented defaults and the standard deadines.
+    /// A task with the documented defaults and the standard deadlines.
     pub fn new(settings: BackupSettings) -> Self {
         Self {
+            task_name: "postgres_backup".to_string(),
             settings,
             destination: PathBuf::from(DEFAULT_BACKUP_DIR),
             keep_backups: DEFAULT_KEEP_BACKUPS,
@@ -55,6 +58,12 @@ impl BackupTask {
             // Listing an archive is a metadata read: seconds, not minutes.
             verify_timeout: Duration::from_secs(120),
         }
+    }
+
+    /// Name this backup after the configured scheduled task (`I4.1`).
+    pub fn with_task_name(mut self, task_name: impl Into<String>) -> Self {
+        self.task_name = task_name.into();
+        self
     }
 
     /// Run the task, returning an outcome rather than an error.
@@ -81,6 +90,10 @@ impl BackupTask {
                 &format!("cannot create {}: {error}", self.destination.display()),
             );
         }
+
+        // Sweep any stale `.dump.partial` files left for this database by a prior
+        // crash or SIGKILL before writing a new partial archive (`I4.1`).
+        self.sweep_stale_partials(&plan.partial);
 
         // 1. The dump itself.
         let dump = match executor.run(&plan.dump).await {
@@ -134,6 +147,7 @@ impl BackupTask {
         let verify = match executor.run(&plan.verify).await {
             Ok(output) => output,
             Err(ExecutionError::Spawn { reason, .. }) => {
+                self.discard(&plan);
                 return self.outcome(
                     started,
                     MaintenanceStatus::Failed,
@@ -197,8 +211,6 @@ impl BackupTask {
             );
         }
 
-        let _ = std::fs::remove_file(&plan.restore_temp);
-
         if let Err(error) = std::fs::rename(&plan.partial, &plan.destination) {
             self.discard(&plan);
             return self.outcome(
@@ -243,7 +255,7 @@ impl BackupTask {
         detail: &str,
     ) -> MaintenanceOutcome {
         MaintenanceOutcome {
-            task: "postgres_backup".to_string(),
+            task: self.task_name.clone(),
             status,
             exit_code,
             duration: started.elapsed(),
@@ -254,7 +266,27 @@ impl BackupTask {
     /// Remove whatever a failed run may have left behind.
     fn discard(&self, plan: &BackupPlan) {
         let _ = std::fs::remove_file(&plan.partial);
-        let _ = std::fs::remove_file(&plan.restore_temp);
+    }
+
+    /// Remove stale `.dump.partial` files for this database from earlier crashes,
+    /// leaving the current run's `active_partial` untouched so pre-seeded test
+    /// fixtures and live partial targets are preserved until `pg_dump` runs.
+    fn sweep_stale_partials(&self, active_partial: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(&self.destination) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == active_partial {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if belongs_to_database_partial(name, &self.settings.database) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 
     /// Delete the backups beyond the retention limit, returning how many went.
@@ -598,6 +630,7 @@ mod tests {
         }
 
         let task = BackupTask {
+            task_name: "uno_nightly".to_string(),
             settings: super::super::backup::BackupSettings::new(
                 "host", 5432, "user", "uno", "secret",
             ),
@@ -661,6 +694,7 @@ mod tests {
         }
 
         let task = BackupTask {
+            task_name: "uno_nightly".to_string(),
             settings: super::super::backup::BackupSettings::new(
                 "host", 5432, "user", "uno", "secret",
             ),
@@ -745,9 +779,59 @@ mod tests {
             "a failed verification must not prune the previous backup"
         );
         assert!(
-            !current.partial.exists() && !current.restore_temp.exists(),
+            !current.partial.exists(),
             "a failed run left its scratch files behind"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn outcome_carries_configured_task_name_and_cleans_partials() {
+        let dir = scratch_dir("task-identity-and-partials");
+        let task = task_in(&dir, 7).with_task_name("ecommerce_nightly");
+
+        // Stale partial from an earlier SIGKILL on the same database vs sibling DB.
+        let stale_same_db = dir.join("guardianrs-bookgraph-20260301T033000.dump.partial");
+        let sibling_db_partial = dir.join("guardianrs-other-20260301T033000.dump.partial");
+        std::fs::write(&stale_same_db, b"interrupted").expect("stale partial");
+        std::fs::write(&sibling_db_partial, b"sibling").expect("sibling partial");
+
+        write_dump(&task, now(), b"new dump");
+        let current = plan_dump(
+            &task.settings,
+            &dir,
+            now(),
+            task.timeout,
+            task.grace,
+            task.verify_timeout,
+        );
+
+        // Simulate pg_dump succeeding and pg_restore failing to spawn on verify.
+        let (executor, _) = executor_with(vec![
+            Ok(ok(0)),
+            Err(ExecutionError::Spawn {
+                program: "pg_restore".to_string(),
+                reason: "missing binary".to_string(),
+            }),
+        ]);
+
+        let outcome = task.run(&executor, now()).await;
+
+        assert_eq!(outcome.task, "ecommerce_nightly");
+        assert_eq!(outcome.status, MaintenanceStatus::Failed);
+        assert!(
+            !stale_same_db.exists(),
+            "stale partial for this database must be swept"
+        );
+        assert!(
+            !current.partial.exists(),
+            "verify spawn failure must discard current partial archive"
+        );
+        assert!(
+            sibling_db_partial.exists(),
+            "another database's partial file must not be touched"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -60,8 +60,16 @@ fn one_task(
         .clone()
         .unwrap_or_else(|| instance.database.clone());
 
-    if database.trim().is_empty() {
-        return Err(format!("task {}: database must not be empty", task.name));
+    if database.trim().is_empty()
+        || database.contains('/')
+        || database.contains('\\')
+        || database.contains("..")
+        || database.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "task {}: database must be a non-empty path-safe identifier",
+            task.name
+        ));
     }
 
     let password = instance
@@ -69,6 +77,7 @@ fn one_task(
         .map_err(|error| format!("task {}: {error}", task.name))?;
 
     let backup = BackupTask {
+        task_name: task.name.clone(),
         settings: BackupSettings::new(
             &instance.host,
             instance.port,

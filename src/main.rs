@@ -22,8 +22,15 @@ use guardian_rs::services::maintenance::{scheduled_tasks, MaintenanceScheduler, 
 use guardian_rs::services::orchestrator::{Orchestrator, OrchestratorDeps};
 
 fn main() -> Result<()> {
-    // Load .env file (does not crash if missing — production uses systemd EnvironmentFile)
-    dotenvy::dotenv().ok();
+    // Select configuration root first so optional .env fallback pairs with the
+    // active config file rather than trusting the caller's working directory (I3.3).
+    let config_path = if std::path::Path::new("/opt/guardianrs/guardian.yaml").exists() {
+        dotenvy::from_path("/opt/guardianrs/.env").ok();
+        "/opt/guardianrs/guardian.yaml"
+    } else {
+        dotenvy::dotenv().ok();
+        "configs/guardian.yaml"
+    };
 
     // Initialize tracing subscriber.
     // Default level is info — clean, production-ready output.
@@ -35,13 +42,6 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // Load configuration from YAML + env vars.
-    // Try production path first (/opt/guardianrs/), then development path.
-    let config_path = if std::path::Path::new("/opt/guardianrs/guardian.yaml").exists() {
-        "/opt/guardianrs/guardian.yaml"
-    } else {
-        "configs/guardian.yaml"
-    };
     let config = config::load(config_path)?;
     info!("GuardianRS configuration loaded");
     info!(

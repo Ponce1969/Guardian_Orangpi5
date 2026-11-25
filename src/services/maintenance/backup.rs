@@ -66,6 +66,14 @@ pub fn belongs_to_database(name: &str, database: &str) -> bool {
     }
 }
 
+/// Whether `name` is an unfinished `.partial` dump of exactly `database`.
+pub fn belongs_to_database_partial(name: &str, database: &str) -> bool {
+    match name.strip_suffix(".partial") {
+        Some(base) => belongs_to_database(base, database),
+        None => false,
+    }
+}
+
 /// Read the timestamp back out of a backup name.
 ///
 /// The timestamp is a fixed-width suffix, so a database name containing dashes
@@ -182,20 +190,18 @@ impl std::fmt::Debug for BackupSettings {
     }
 }
 
-/// The two commands a backup runs, and the file between them.
+/// The commands a backup runs, and the archive file between them.
 #[derive(Debug, Clone)]
 pub struct BackupPlan {
     /// The name the verified archive is published under.
     pub destination: std::path::PathBuf,
     /// Where the dump lives until it is proven.
     pub partial: std::path::PathBuf,
-    /// The file the data pass restores into, removed afterwards.
-    pub restore_temp: std::path::PathBuf,
     /// Writes the dump.
     pub dump: ExecutionRequest,
     /// Proves the dump is a readable archive.
     pub verify: ExecutionRequest,
-    /// Proves the archive's data can be read, not just its table of contents.
+    /// Proves the archive's data can be decompressed to null without touching disk.
     pub restore: ExecutionRequest,
 }
 
@@ -227,7 +233,6 @@ pub fn plan_dump(
     // The dump is written beside its final name: a run that dies mid-write must
     // never leave a truncated archive where retention expects a good backup.
     let partial = with_suffix(&destination, ".partial");
-    let restore_temp = with_suffix(&destination, ".restore");
     let partial_arg = partial.to_string_lossy().to_string();
 
     let dump = ExecutionRequest::new(
@@ -259,22 +264,19 @@ pub fn plan_dump(
         verify_timeout,
     );
 
-    // Reading the data back is what proves the archive is restorable, and
-    // retention depends on that proof rather than on a header.
+    // Stream decompressed SQL to `-` (stdout) while attaching stdout to the OS
+    // null device (`I4.1`): every compressed block is verified in memory without
+    // 5x-10x disk write amplification or cleartext SQL files on flash storage.
     let restore = ExecutionRequest::new(
         "pg_restore",
-        vec![
-            "--file".to_string(),
-            restore_temp.to_string_lossy().to_string(),
-            partial_arg,
-        ],
+        vec!["--file".to_string(), "-".to_string(), partial_arg],
         verify_timeout,
-    );
+    )
+    .with_discarded_stdout();
 
     BackupPlan {
         destination,
         partial,
-        restore_temp,
         dump,
         verify,
         restore,
@@ -554,10 +556,10 @@ mod tests {
         );
     }
 
-    /// Verification reads a file, so it needs no credentials and must not carry
-    /// the secret around at all.
+    /// Verification reads a file without credentials and streams decompressed
+    /// data to null output rather than writing a cleartext SQL file (`I4.1`).
     #[test]
-    fn verification_reads_the_file_without_credentials() {
+    fn verification_streams_to_null_without_temp_file() {
         let plan = plan();
         let partial = plan.partial.to_string_lossy().to_string();
 
@@ -569,11 +571,14 @@ mod tests {
             "listing an archive needs no secret"
         );
         assert_eq!(plan.restore.program(), "pg_restore");
-        assert!(plan.restore.args().contains(&partial));
-        assert!(plan
-            .restore
-            .args()
-            .contains(&plan.restore_temp.to_string_lossy().to_string()));
+        assert_eq!(
+            plan.restore.args(),
+            &["--file".to_string(), "-".to_string(), partial]
+        );
+        assert!(
+            !plan.restore.captures_stdout(),
+            "restore data verification must discard stdout to the null device"
+        );
         assert!(
             plan.restore.env().is_empty(),
             "reading the data needs no secret either"
