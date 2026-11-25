@@ -13,6 +13,7 @@ use crate::notifiers::outbox::{
     self, decorate_payload, DeliveryOutbox, OutboxKey, OutboxPriority, DEFAULT_OUTBOX_CAPACITY,
 };
 use crate::notifiers::{Notifier, NotifierError};
+use crate::services::digest::DigestReport;
 use crate::services::maintenance::{tail_chars, MaintenanceOutcome, MaintenanceStatus};
 
 /// Default TCP/TLS handshake deadline for Discord webhook calls (`I2.1`).
@@ -274,6 +275,66 @@ impl DiscordNotifier {
         }
 
         serde_json::json!({ "embeds": [embed] })
+    }
+
+    /// Build the daily liveness digest embed (`I4.2`).
+    fn build_digest_payload(digest: &DigestReport, hostname: &str) -> serde_json::Value {
+        let (emoji, colour) = match digest.severity_rank() {
+            2 => ("🚨", color::CRITICAL),
+            1 => ("⚠️", color::WARNING),
+            _ => ("🟢", color::RECOVERED),
+        };
+
+        let mut fields = vec![
+            serde_json::json!({
+                "name": "Nightly Backups",
+                "value": digest.format_tasks(),
+                "inline": false
+            }),
+            serde_json::json!({
+                "name": "Collectors",
+                "value": digest.format_collectors(),
+                "inline": false
+            }),
+            serde_json::json!({
+                "name": "Open Alerts",
+                "value": digest.format_open_alerts(),
+                "inline": false
+            }),
+            serde_json::json!({
+                "name": "Host",
+                "value": hostname,
+                "inline": true
+            }),
+            serde_json::json!({
+                "name": "Scheduled Slot",
+                "value": digest.scheduled_slot,
+                "inline": true
+            }),
+        ];
+
+        if let Some(late) = digest.late_by {
+            let mins = (late.as_secs() / 60).max(1);
+            fields.push(serde_json::json!({
+                "name": "Catch-up Notice",
+                "value": format!(
+                    "Delivered ~{mins}m late (daemon was offline at scheduled time)"
+                ),
+                "inline": false
+            }));
+        }
+
+        serde_json::json!({
+            "embeds": [{
+                "title": format!("{emoji} Daily Digest — {} ({hostname})", digest.target_date),
+                "color": colour,
+                "timestamp": digest.generated_at.to_rfc3339(),
+                "fields": fields,
+                "footer": {
+                    "text": format!("🛡️ GuardianRS liveness ({})", digest.local_offset)
+                }
+            }]
+        })
     }
 
     /// Read at most `MAX_ERROR_BODY_BYTES` from a failed HTTP response and cap
@@ -570,6 +631,20 @@ impl Notifier for DiscordNotifier {
         );
 
         self.deliver_keyed(key, OutboxPriority::Active, payload)
+            .await
+    }
+
+    async fn send_digest(&self, digest: &DigestReport) -> Result<(), NotifierError> {
+        let payload = Self::build_digest_payload(digest, &self.hostname);
+
+        info!(
+            notifier = "discord",
+            date = %digest.target_date,
+            late = digest.late_by.is_some(),
+            "Dispatching daily liveness digest to Discord"
+        );
+
+        self.deliver_keyed(OutboxKey::Digest, OutboxPriority::Active, payload)
             .await
     }
 

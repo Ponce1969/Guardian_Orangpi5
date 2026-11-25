@@ -3,6 +3,7 @@ use tracing::{info, warn};
 
 use crate::alerts::AlertEvent;
 use crate::notifiers::{Notifier, NotifierError};
+use crate::services::digest::DigestReport;
 use crate::services::maintenance::{MaintenanceOutcome, MaintenanceStatus};
 
 /// Dispatches alert events to structured logs via the `tracing` framework.
@@ -77,6 +78,20 @@ impl Notifier for LogNotifier {
             ),
         }
 
+        Ok(())
+    }
+
+    async fn send_digest(&self, digest: &DigestReport) -> Result<(), NotifierError> {
+        info!(
+            notifier = "log",
+            date = %digest.target_date,
+            scheduled = %digest.scheduled_slot,
+            late_secs = digest.late_by.map(|d| d.as_secs()),
+            collector_failures = digest.collector_failures.len(),
+            open_alerts = digest.open_alerts.len(),
+            tasks = digest.tasks.len(),
+            "Daily liveness digest generated"
+        );
         Ok(())
     }
 }

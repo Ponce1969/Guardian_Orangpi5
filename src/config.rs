@@ -47,6 +47,41 @@ pub struct GuardianConfig {
     /// Scheduled maintenance. An absent section means disabled.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Daily human liveness digest (`I4.2`). Enabled at `08:00` local time by
+    /// default unless explicitly opted out with `digest.enabled: false`.
+    #[serde(default)]
+    pub digest: DigestConfig,
+}
+
+/// Daily human liveness digest configuration (`I4.2`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DigestConfig {
+    /// Whether the daily digest is sent. Enabled by default; requires explicit
+    /// `enabled: false` to opt out.
+    #[serde(default = "default_digest_enabled")]
+    pub enabled: bool,
+    /// Host-local time of day (`HH:MM`), defaulting to `"08:00"` after the
+    /// `03:30`–`03:40` maintenance window closes.
+    #[serde(default = "default_digest_daily_at")]
+    pub daily_at: String,
+}
+
+fn default_digest_enabled() -> bool {
+    true
+}
+
+fn default_digest_daily_at() -> String {
+    "08:00".to_string()
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_digest_enabled(),
+            daily_at: default_digest_daily_at(),
+        }
+    }
 }
 
 /// Docker monitoring settings.
@@ -420,6 +455,32 @@ const ALLOWED_DISCORD_HOSTS: &[&str] = &[
     "canary.discordapp.com",
 ];
 
+fn validate_daily_at_format(field: &str, raw: &str) -> Result<(u32, u32), ConfigError> {
+    let Some((hour_str, minute_str)) = raw.split_once(':') else {
+        return Err(ConfigError::Invalid {
+            details: format!("{field} {raw:?} must use HH:MM format"),
+        });
+    };
+    let hour_trimmed = hour_str.trim();
+    let min_trimmed = minute_str.trim();
+    let Ok(hour) = hour_trimmed.parse::<u32>() else {
+        return Err(ConfigError::Invalid {
+            details: format!("{field} {raw:?} has an invalid hour"),
+        });
+    };
+    let Ok(minute) = min_trimmed.parse::<u32>() else {
+        return Err(ConfigError::Invalid {
+            details: format!("{field} {raw:?} has an invalid minute"),
+        });
+    };
+    if hour > 23 || minute > 59 {
+        return Err(ConfigError::Invalid {
+            details: format!("{field} {raw:?} is out of valid 00:00..23:59 range"),
+        });
+    }
+    Ok((hour, minute))
+}
+
 fn validate_safe_identifier(field: &str, value: &str) -> Result<(), ConfigError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -611,6 +672,7 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
     }
 
     validate_thresholds(&config.thresholds)?;
+    validate_daily_at_format("digest.daily_at", &config.digest.daily_at)?;
 
     // Resolve secrets from environment variables
     if config.notification.discord.enabled {

@@ -60,6 +60,17 @@ pub trait Notifier: Send + Sync {
         outcome: &crate::services::maintenance::MaintenanceOutcome,
     ) -> Result<(), NotifierError>;
 
+    /// Dispatch the daily human liveness digest (`I4.2`).
+    ///
+    /// Defaulted to `Ok(())` for lightweight test doubles that only record
+    /// alerts or maintenance outcomes unless explicitly testing digests.
+    async fn send_digest(
+        &self,
+        _digest: &crate::services::digest::DigestReport,
+    ) -> Result<(), NotifierError> {
+        Ok(())
+    }
+
     /// Drain any queued outbound messages whose previous delivery failed due to
     /// transient network or remote endpoint errors (`I2.3`).
     ///

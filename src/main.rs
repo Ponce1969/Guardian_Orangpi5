@@ -18,7 +18,9 @@ use guardian_rs::config;
 use guardian_rs::notifiers::discord::DiscordNotifier;
 use guardian_rs::notifiers::log::LogNotifier;
 use guardian_rs::notifiers::Notifier;
-use guardian_rs::services::maintenance::{scheduled_tasks, MaintenanceScheduler, ProcessExecutor};
+use guardian_rs::services::maintenance::{
+    scheduled_tasks, DailyTime, MaintenanceScheduler, ProcessExecutor,
+};
 use guardian_rs::services::orchestrator::{Orchestrator, OrchestratorDeps};
 
 fn main() -> Result<()> {
@@ -162,6 +164,29 @@ fn main() -> Result<()> {
         }
     };
 
+    let digest_at = if config.digest.enabled {
+        let daily = config
+            .digest
+            .daily_at
+            .split_once(':')
+            .and_then(|(h, m)| Some((h.trim().parse().ok()?, m.trim().parse().ok()?)))
+            .and_then(|(h, m)| DailyTime::new(h, m))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid digest.daily_at {:?} (expected HH:MM)",
+                    config.digest.daily_at
+                )
+            })?;
+        info!(
+            daily_at = %config.digest.daily_at,
+            "Daily human liveness digest enabled"
+        );
+        Some(daily)
+    } else {
+        info!("Daily human liveness digest disabled by configuration");
+        None
+    };
+
     let orchestrator = Orchestrator::new(OrchestratorDeps {
         collectors,
         alert_engine: Box::new(alert_engine),
@@ -175,6 +200,7 @@ fn main() -> Result<()> {
             .state_path
             .as_ref()
             .map(std::path::PathBuf::from),
+        digest_at,
     });
 
     info!("Starting GuardianRS daemon");

@@ -72,6 +72,11 @@ impl ScheduledTask {
         self.last_status
     }
 
+    /// Local wall-clock timestamp of the most recent recorded run, if any.
+    pub fn last_run_wall(&self) -> Option<NaiveDateTime> {
+        self.last_run_wall
+    }
+
     /// Whether this task is due, and why.
     fn due(&self, now_wall: NaiveDateTime, now_mono: Instant) -> Option<DueReason> {
         match self.schedule {
@@ -113,6 +118,11 @@ impl MaintenanceScheduler {
     /// The task at `index`, for the caller that has just been told it is due.
     pub fn task(&self, index: usize) -> Option<&ScheduledTask> {
         self.tasks.get(index)
+    }
+
+    /// Every configured task in declaration order (used by the daily digest).
+    pub fn tasks(&self) -> &[ScheduledTask] {
+        &self.tasks
     }
 
     /// The one task that should run this tick, with the reason, or `None`.
@@ -198,6 +208,9 @@ impl MaintenanceScheduler {
             };
 
             task.last_run_wall = state.last_run(&task.name);
+            // `export_state` persists only proven `Success` runs, so restoring a
+            // recorded timestamp also restores its `Success` status for the digest.
+            task.last_status = Some(MaintenanceStatus::Success);
 
             // `checked_sub` fails when the elapsed time reaches further back than
             // the platform can represent from now, which happens when the run

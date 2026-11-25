@@ -17,19 +17,21 @@
 use std::io::Write;
 use std::path::Path;
 
-use chrono::{NaiveDateTime, TimeDelta};
+use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the on-disk shape changes in a way an older build cannot read.
 const FORMAT_VERSION: u32 = 1;
 
-/// The record of completed runs.
+/// The record of completed runs and daily digests.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MaintenanceState {
     #[serde(default = "current_version")]
     version: u32,
     #[serde(default)]
     tasks: Vec<TaskState>,
+    #[serde(default)]
+    last_digest_date: Option<NaiveDate>,
 }
 
 /// One task's last completed run.
@@ -48,6 +50,7 @@ impl Default for MaintenanceState {
         Self {
             version: FORMAT_VERSION,
             tasks: Vec::new(),
+            last_digest_date: None,
         }
     }
 }
@@ -58,7 +61,19 @@ impl MaintenanceState {
         Self {
             version: FORMAT_VERSION,
             tasks,
+            last_digest_date: None,
         }
+    }
+
+    /// Attach the most recent local calendar date for which the daily digest ran.
+    pub fn with_last_digest_date(mut self, date: Option<NaiveDate>) -> Self {
+        self.last_digest_date = date;
+        self
+    }
+
+    /// Local calendar date of the last delivered daily digest, if any.
+    pub fn last_digest_date(&self) -> Option<NaiveDate> {
+        self.last_digest_date
     }
 
     /// How many runs are recorded.

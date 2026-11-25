@@ -78,3 +78,9 @@ maintenance:
       kind: postgres_backup
       daily_at: "03:40"
       instance: ecommerce
+
+# Human liveness digest (`I4.2`), separate from the 03:30-03:40 machine backup window.
+# Evaluates in host local time; set `enabled: false` explicitly to opt out.
+digest:
+  enabled: true
+  daily_at: "08:00"

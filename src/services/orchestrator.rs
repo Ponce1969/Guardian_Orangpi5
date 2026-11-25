@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{Local, NaiveDate, Utc};
 use futures::future::join_all;
 use tokio::sync::watch;
 use tokio::time;
@@ -11,8 +12,12 @@ use crate::alerts::AlertEvaluator;
 use crate::collectors::Collector;
 use crate::collectors::CollectorError;
 use crate::notifiers::Notifier;
+use crate::services::digest::{
+    evaluate_digest_due, format_alert_series, summarize_tasks, DigestAlertSummary, DigestReport,
+    DEFAULT_LATE_GRACE,
+};
 use crate::services::maintenance::{
-    state, Executor, MaintenanceOutcome, MaintenanceScheduler, MaintenanceStatus,
+    state, DailyTime, Executor, MaintenanceOutcome, MaintenanceScheduler, MaintenanceStatus,
 };
 
 /// Everything the orchestrator needs to run.
@@ -32,6 +37,8 @@ pub struct OrchestratorDeps {
     pub state_path: Option<PathBuf>,
     /// Alerts are not evaluated during this window after construction.
     pub startup_grace: Duration,
+    /// Optional host-local daily digest time (`None` when `digest.enabled: false`).
+    pub digest_at: Option<DailyTime>,
 }
 
 /// The Orchestrator wires collectors, the alert engine, and notifiers
@@ -57,6 +64,9 @@ pub struct Orchestrator {
     executor: Box<dyn Executor>,
     state_path: Option<PathBuf>,
     startup_grace: Duration,
+    digest_at: Option<DailyTime>,
+    last_digest_date: Option<NaiveDate>,
+    collector_failures: BTreeMap<String, u64>,
     started: Instant,
     grace_announced: bool,
 }
@@ -72,6 +82,9 @@ impl Orchestrator {
             executor: deps.executor,
             state_path: deps.state_path,
             startup_grace: deps.startup_grace,
+            digest_at: deps.digest_at,
+            last_digest_date: None,
+            collector_failures: BTreeMap::new(),
             started: Instant::now(),
             grace_announced: false,
         }
@@ -138,16 +151,84 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Execute one full cycle across fault-isolated phases (`I2.3`):
+    /// Execute one full cycle across fault-isolated phases (`I2.3`, `I4.2`):
     ///
     /// 1. metric collection and alert evaluation;
     /// 2. at most one due maintenance task;
-    /// 3. outbound transport flush (always runs, even when collection failed,
+    /// 3. daily human liveness digest when due;
+    /// 4. outbound transport flush (always runs, even when collection failed,
     ///    startup grace deferred evaluation, or no new events fired).
     async fn tick(&mut self, tick: u64, shutdown: &mut watch::Receiver<bool>) {
-        self.collect_and_alert().await;
+        self.collect_and_alert(tick).await;
         self.maintain(shutdown, tick).await;
+        self.maybe_send_digest().await;
         self.flush_notifications().await;
+    }
+
+    async fn maybe_send_digest(&mut self) {
+        let Some(at) = self.digest_at else {
+            return;
+        };
+
+        // Defer catch-up until startup grace finishes so post-reboot database
+        // probes have settled before the digest summarizes open alerts (`I4.2`).
+        if self.started.elapsed() < self.startup_grace {
+            return;
+        }
+
+        let now_local = Local::now();
+        let Some(trigger) = evaluate_digest_due(
+            &Local,
+            at,
+            self.last_digest_date,
+            &now_local,
+            DEFAULT_LATE_GRACE,
+        ) else {
+            return;
+        };
+
+        let open_alerts = self
+            .alert_engine
+            .active_alerts()
+            .into_iter()
+            .map(|(key, state)| DigestAlertSummary {
+                series: format_alert_series(&key),
+                state,
+            })
+            .collect();
+
+        let collector_failures: Vec<(String, u64)> = self
+            .collector_failures
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect();
+
+        let tasks = summarize_tasks(self.maintenance.tasks(), now_local.naive_local());
+
+        let report = DigestReport {
+            generated_at: Utc::now(),
+            local_offset: now_local.offset().to_string(),
+            target_date: trigger.target_date,
+            scheduled_slot: trigger.scheduled_slot,
+            late_by: trigger.late_by,
+            collector_failures,
+            open_alerts,
+            tasks,
+        };
+
+        for notifier in &self.notifiers {
+            if let Err(error) = notifier.send_digest(&report).await {
+                error!(
+                    notifier = notifier.name(),
+                    error = %error,
+                    "Daily digest notification failed (spooled if retryable)"
+                );
+            }
+        }
+
+        self.last_digest_date = Some(trigger.target_date);
+        self.collector_failures.clear();
+        self.persist_state();
     }
 
     async fn flush_notifications(&mut self) {
@@ -275,11 +356,13 @@ impl Orchestrator {
         match state::load(&path) {
             Ok(recorded) => {
                 self.maintenance.restore(&recorded, now_wall, now_mono);
+                self.last_digest_date = recorded.last_digest_date();
 
                 info!(
                     runs = recorded.len(),
+                    last_digest = ?self.last_digest_date,
                     path = %path.display(),
-                    "Maintenance state restored"
+                    "Maintenance and digest state restored"
                 );
             }
             Err(reason) => warn!(
@@ -299,7 +382,10 @@ impl Orchestrator {
             return;
         };
 
-        let snapshot = self.maintenance.export_state();
+        let snapshot = self
+            .maintenance
+            .export_state()
+            .with_last_digest_date(self.last_digest_date);
 
         if let Err(reason) = state::save(path, &snapshot) {
             warn!(
@@ -311,28 +397,39 @@ impl Orchestrator {
     }
 
     /// Collect metrics, evaluate alerts and dispatch them.
-    async fn collect_and_alert(&mut self) {
+    async fn collect_and_alert(&mut self, tick: u64) {
         // === Collect ===
         let mut handles = Vec::with_capacity(self.collectors.len());
+        let names: Vec<String> = self
+            .collectors
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         for collector in &self.collectors {
             handles.push(collector.collect_all());
         }
 
         let results = join_all(handles).await;
-        let snapshots: Vec<_> = results
-            .into_iter()
-            .flat_map(|r| match r {
-                Ok(snaps) => snaps,
+        let mut snapshots = Vec::new();
+        for (name, result) in names.into_iter().zip(results) {
+            match result {
+                Ok(snaps) => snapshots.extend(snaps),
                 Err(e @ CollectorError::Unavailable { .. }) => {
-                    warn!(error = %e, "Collector warming up");
-                    Vec::new()
+                    warn!(collector = %name, error = %e, "Collector warming up or unavailable");
+                    // First-tick baseline establishment in CPU/network is expected,
+                    // whereas unavailability on later ticks is recorded for the digest.
+                    if tick > 1 {
+                        let counter = self.collector_failures.entry(name).or_insert(0);
+                        *counter = counter.saturating_add(1);
+                    }
                 }
                 Err(e) => {
-                    error!(error = %e, "Collection failed");
-                    Vec::new()
+                    error!(collector = %name, error = %e, "Collection failed");
+                    let counter = self.collector_failures.entry(name).or_insert(0);
+                    *counter = counter.saturating_add(1);
                 }
-            })
-            .collect();
+            }
+        }
 
         if snapshots.is_empty() {
             warn!("No metrics collected this cycle");
@@ -484,6 +581,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
             state_path: Some(path.clone()),
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         let (_tx, mut rx) = watch::channel(false);
@@ -508,6 +606,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![])))),
             state_path: Some(path.clone()),
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         second.restore_state(Local::now().naive_local(), Instant::now());
@@ -536,6 +635,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         let (tx, rx) = watch::channel(false);
@@ -634,6 +734,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure(), failure()])))),
             state_path: None,
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         (orchestrator, seen)
@@ -697,6 +798,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         let (_tx, mut rx) = watch::channel(false);
@@ -725,9 +827,10 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
             startup_grace: Duration::from_secs(3600),
+            digest_at: None,
         });
 
-        orchestrator.collect_and_alert().await;
+        orchestrator.collect_and_alert(1).await;
 
         assert_eq!(
             *alerts.lock().expect("lock"),
@@ -753,9 +856,10 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
-        orchestrator.collect_and_alert().await;
+        orchestrator.collect_and_alert(1).await;
 
         assert_eq!(
             *alerts.lock().expect("lock"),
@@ -794,6 +898,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         let (_tx, mut rx) = watch::channel(false);
@@ -835,6 +940,7 @@ mod tests {
             executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure(), failure()])))),
             state_path: None,
             startup_grace: Duration::ZERO,
+            digest_at: None,
         });
 
         let (_tx, mut rx) = watch::channel(false);
@@ -896,6 +1002,7 @@ mod tests {
                 executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
                 state_path: None,
                 startup_grace: Duration::ZERO,
+                digest_at: None,
             });
 
             // Requested already, so the signal branch is ready on the first poll,
