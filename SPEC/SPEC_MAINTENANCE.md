@@ -289,23 +289,18 @@ needs:
 
 ### Required unit changes
 
-The current unit makes maintenance impossible, and not marginally:
+With `ProtectSystem=strict`, the entire filesystem is read-only for the process
+**and everything it spawns** except explicitly declared paths, and
+`ProtectHome=true` rules out a home directory. Collectors only read `/proc` and
+`/sys`, so neither pseudo-filesystem belongs in `ReadWritePaths`.
+
+The minimum writable surface and file-mode mask (see
+`SPEC_SECURITY_HARDENING.md` I5 for the full unit policy and why
+`SupplementaryGroups=docker` is omitted by default):
 
 ```ini
-ProtectSystem=strict
-ReadWritePaths=/proc /sys
-```
-
-The entire filesystem is read-only for the process **and everything it spawns**,
-so a `pg_dump` child cannot write its dump anywhere. `ProtectHome=true` rules
-out a home directory, and `User=guardianrs` is not in the `docker` group, so the
-Docker collector cannot reach the socket either.
-
-The minimum addition:
-
-```ini
-SupplementaryGroups=docker
-ReadWritePaths=/proc /sys /var/backups/guardianrs /var/lib/guardianrs
+UMask=0077
+ReadWritePaths=/var/backups/guardianrs /var/lib/guardianrs
 ```
 
 No wider path, and `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`
