@@ -38,14 +38,24 @@ pub enum AlertState {
     Critical,
 }
 
-/// What an alert is about: a metric kind plus the labels that tell one series from
-/// another.
+/// Label names that identify an independent resource series rather than
+/// point-in-time telemetry.
+///
+/// Collectors attach dynamic measurements (`available_kb`, `available_bytes`,
+/// `running`, per-category Docker gigabytes) to `MetricSnapshot.labels` for
+/// diagnostic context. Including those in [`AlertKey`] would create a distinct
+/// key on every cycle, defeating deduplication, suppressing `Recovered`, and
+/// growing tracker memory without bound (`SPEC_SECURITY_HARDENING.md` I1.1).
+pub const IDENTITY_LABELS: &[&str] = &["database", "host", "instance", "mount", "zone"];
+
+/// What an alert is about: a metric kind plus the static identity labels that
+/// tell one resource series from another.
 ///
 /// Keying state by `MetricKind` alone was invisible with one PostgreSQL instance and
 /// wrong with three: the second instance going critical produced no transition
 /// because the first already had, and the first recovering emitted a `Recovered`
 /// while the second was still down.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AlertKey {
     kind: MetricKind,
     /// Sorted at construction so two snapshots carrying the same labels in a
@@ -54,8 +64,7 @@ pub struct AlertKey {
 }
 
 impl AlertKey {
-    /// The key for a metric with no labels: exactly the old behaviour, one state per
-    /// kind.
+    /// The key for a metric with no labels: one state per kind.
     pub fn for_kind(kind: MetricKind) -> Self {
         Self {
             kind,
@@ -63,11 +72,12 @@ impl AlertKey {
         }
     }
 
-    /// The key a snapshot belongs to.
+    /// The key a snapshot belongs to, keeping only static identity labels.
     pub fn from_snapshot(snapshot: &MetricSnapshot) -> Self {
         let mut labels: Vec<(String, String)> = snapshot
             .labels
             .iter()
+            .filter(|(name, _)| IDENTITY_LABELS.contains(&name.as_str()))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         labels.sort();
@@ -115,25 +125,43 @@ impl AlertStateTracker {
         self.states.get(&key.into()).copied().unwrap_or_default()
     }
 
+    /// Number of currently tracked non-normal series.
+    pub fn active_count(&self) -> usize {
+        self.states.len()
+    }
+
+    /// All currently active (`Warning` or `Critical`) series in deterministic order.
+    pub fn active_alerts(&self) -> Vec<(AlertKey, AlertState)> {
+        let mut active: Vec<(AlertKey, AlertState)> = self
+            .states
+            .iter()
+            .map(|(key, state)| (key.clone(), *state))
+            .collect();
+        active.sort_by(|(left, _), (right, _)| left.cmp(right));
+        active
+    }
+
     /// Transition to a new state. Returns `Some(old_state)` if the
     /// state actually changed, `None` if it remained the same.
     ///
-    /// Special case: transitioning from implicit Normal (never seen)
-    /// to explicit Normal is NOT a transition — no event should fire.
+    /// Healthy (`Normal`) series are evicted rather than retained so tracker
+    /// memory stays `O(active alerts)` regardless of uptime (`I1.2`).
     pub fn transition(
         &mut self,
         key: impl Into<AlertKey>,
         new_state: AlertState,
     ) -> Option<AlertState> {
-        let old_state = self.states.insert(key.into(), new_state);
+        let key = key.into();
+        if new_state == AlertState::Normal {
+            return self.states.remove(&key);
+        }
+
+        let old_state = self.states.insert(key, new_state);
         match old_state {
             // Same state — no transition.
             Some(prev) if prev == new_state => None,
             // Different state — real transition.
             Some(prev) => Some(prev),
-            // First time seeing this metric.
-            // Entering Normal from implicit Normal is not a transition.
-            None if new_state == AlertState::Normal => None,
             // Entering Warning/Critical from implicit Normal IS a transition.
             None => Some(AlertState::Normal),
         }
@@ -186,5 +214,67 @@ mod tests {
         let mut tracker = AlertStateTracker::new();
         tracker.transition(MetricKind::CpuUsage, AlertState::Warning);
         assert_eq!(tracker.get(MetricKind::MemoryUsage), AlertState::Normal);
+    }
+
+    #[test]
+    fn telemetry_labels_do_not_change_alert_key() {
+        let first = MetricSnapshot::new(MetricKind::DiskUsage, 84.0)
+            .with_label("mount", "/")
+            .with_label("total_bytes", "100000")
+            .with_label("available_bytes", "16000");
+        let second = MetricSnapshot::new(MetricKind::DiskUsage, 85.0)
+            .with_label("mount", "/")
+            .with_label("total_bytes", "100000")
+            .with_label("available_bytes", "15000");
+        let other_mount = MetricSnapshot::new(MetricKind::DiskUsage, 85.0)
+            .with_label("mount", "/var/backups")
+            .with_label("available_bytes", "15000");
+
+        let first_key = AlertKey::from_snapshot(&first);
+        let second_key = AlertKey::from_snapshot(&second);
+        let other_key = AlertKey::from_snapshot(&other_mount);
+
+        assert_eq!(
+            first_key, second_key,
+            "volatile telemetry labels must not split one resource into distinct keys"
+        );
+        assert_eq!(
+            first_key.labels(),
+            &[("mount".to_string(), "/".to_string())]
+        );
+        assert_ne!(
+            first_key, other_key,
+            "static identity labels still separate distinct resources"
+        );
+    }
+
+    #[test]
+    fn normal_state_retains_zero_entries_in_tracker() {
+        let mut tracker = AlertStateTracker::new();
+
+        assert!(tracker
+            .transition(MetricKind::MemoryUsage, AlertState::Normal)
+            .is_none());
+        assert_eq!(
+            tracker.active_count(),
+            0,
+            "entering Normal from implicit Normal must not allocate a map entry"
+        );
+
+        assert_eq!(
+            tracker.transition(MetricKind::MemoryUsage, AlertState::Warning),
+            Some(AlertState::Normal)
+        );
+        assert_eq!(tracker.active_count(), 1);
+
+        assert_eq!(
+            tracker.transition(MetricKind::MemoryUsage, AlertState::Normal),
+            Some(AlertState::Warning)
+        );
+        assert_eq!(
+            tracker.active_count(),
+            0,
+            "returning to Normal must evict the entry from the tracker"
+        );
     }
 }

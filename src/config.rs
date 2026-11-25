@@ -51,24 +51,14 @@ pub struct GuardianConfig {
 
 /// Docker monitoring settings.
 ///
-/// Enabled by default so an existing configuration keeps behaving as it did; a
-/// host that revokes socket access must say so here, or the collector will fail
-/// on every cycle instead of staying quiet.
-#[derive(Debug, Deserialize)]
+/// Disabled by default (`I5.1`): reading `/var/run/docker.sock` requires
+/// root-equivalent `docker` group membership, so socket access must be opted into
+/// explicitly rather than attempted whenever the `docker:` block is absent.
+#[derive(Debug, Deserialize, Default)]
 pub struct DockerConfig {
     /// Whether the Docker collector runs at all.
-    #[serde(default = "default_docker_collector_enabled")]
+    #[serde(default)]
     pub enabled: bool,
-}
-
-fn default_docker_collector_enabled() -> bool {
-    true
-}
-
-impl Default for DockerConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// Scheduled maintenance, as it appears in the configuration file.
@@ -312,7 +302,7 @@ pub struct PostgresConfig {
 }
 
 /// One database to watch.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct PostgresInstanceConfig {
     /// What alerts call this database. Use the project name.
     ///
@@ -338,6 +328,21 @@ pub struct PostgresInstanceConfig {
     resolved_password: Option<String>,
 }
 
+impl std::fmt::Debug for PostgresInstanceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresInstanceConfig")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("password_env", &self.password_env)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("resolved_password", &"***")
+            .finish()
+    }
+}
+
 impl PostgresInstanceConfig {
     /// Returns the resolved password.
     ///
@@ -359,7 +364,6 @@ pub struct NotificationConfig {
     pub discord: DiscordConfig,
 }
 
-#[derive(Debug)]
 pub struct DiscordConfig {
     /// Whether Discord notifications are enabled.
     pub enabled: bool,
@@ -369,6 +373,16 @@ pub struct DiscordConfig {
     /// Resolved webhook URL, populated from the environment during config load.
     /// Not deserialized from YAML — secrets never touch the config file.
     resolved_webhook_url: Option<String>,
+}
+
+impl std::fmt::Debug for DiscordConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordConfig")
+            .field("enabled", &self.enabled)
+            .field("webhook_url_env", &self.webhook_url_env)
+            .field("resolved_webhook_url", &"***")
+            .finish()
+    }
 }
 
 impl<'de> Deserialize<'de> for DiscordConfig {
@@ -751,5 +765,71 @@ maintenance:
             message.contains("task"),
             "the error must name the offending key, got: {message}"
         );
+    }
+
+    #[test]
+    fn docker_collector_is_disabled_by_default_when_omitted() {
+        let config: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("legacy YAML parses");
+
+        assert!(
+            !config.docker.enabled,
+            "omitting docker must default to disabled rather than probing the socket"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_webhook_url_and_postgres_passwords() {
+        const WEBHOOK_VAR: &str = "GUARDIAN_TEST_REDACT_WEBHOOK";
+        const PG_VAR: &str = "GUARDIAN_TEST_REDACT_PG_PASS";
+        const SECRET_URL: &str = "https://discord.com/api/webhooks/123456/super-secret-token";
+        const SECRET_PASS: &str = "ultra-secret-pg-password";
+
+        std::env::set_var(WEBHOOK_VAR, SECRET_URL);
+        std::env::set_var(PG_VAR, SECRET_PASS);
+
+        let yaml = format!(
+            r#"
+daemon:
+  poll_interval_secs: 30
+thresholds:
+  cpu_warning: 80
+  cpu_critical: 95
+  memory_warning: 85
+  memory_critical: 95
+  disk_warning: 80
+  disk_critical: 90
+  temp_warning: 70
+  temp_critical: 80
+notification:
+  discord:
+    enabled: true
+    webhook_url_env: {WEBHOOK_VAR}
+postgres:
+  enabled: true
+  instances:
+    - name: auditor
+      host: 127.0.0.1
+      port: 5432
+      database: auditor_familiar
+      user: guardian
+      password_env: {PG_VAR}
+"#
+        );
+
+        let config = load_from_temp(&yaml).expect("valid config");
+        let rendered = format!("{config:?}");
+
+        std::env::remove_var(WEBHOOK_VAR);
+        std::env::remove_var(PG_VAR);
+
+        assert!(
+            !rendered.contains(SECRET_URL) && !rendered.contains("super-secret-token"),
+            "Debug leaked webhook URL: {rendered}"
+        );
+        assert!(
+            !rendered.contains(SECRET_PASS),
+            "Debug leaked Postgres password: {rendered}"
+        );
+        assert!(rendered.contains("auditor"));
     }
 }

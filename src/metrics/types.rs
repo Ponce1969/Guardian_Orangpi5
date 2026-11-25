@@ -5,7 +5,7 @@ use std::collections::HashMap;
 ///
 /// Each variant corresponds to exactly one type of measurement.
 /// Labels provide additional context (e.g., mount point for disk, zone for temperature).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MetricKind {
     CpuUsage,
     MemoryUsage,

@@ -34,6 +34,14 @@ pub trait AlertEvaluator: Send {
     /// (deduplication by design). Returns one `AlertEvent` per
     /// transition.
     fn evaluate(&mut self, snapshot: &MetricSnapshot) -> Vec<AlertEvent>;
+
+    /// Currently open (`Warning` or `Critical`) alert series.
+    ///
+    /// Defaulted to empty so lightweight test evaluators need not implement
+    /// state inspection unless tested for it.
+    fn active_alerts(&self) -> Vec<(AlertKey, AlertState)> {
+        Vec::new()
+    }
 }
 
 /// Default alert engine implementation.
@@ -106,7 +114,9 @@ impl AlertEvaluator for AlertEngine {
             (AlertState::Warning, AlertState::Critical) => AlertSeverity::Critical,
             (AlertState::Warning, AlertState::Normal) => AlertSeverity::Recovered,
             (AlertState::Critical, AlertState::Normal) => AlertSeverity::Recovered,
-            (AlertState::Critical, AlertState::Warning) => AlertSeverity::Recovered,
+            // De-escalation from Critical to Warning is still above the warning
+            // threshold; reporting Recovered would announce green while degraded.
+            (AlertState::Critical, AlertState::Warning) => AlertSeverity::Warning,
             // Defensive: same-state should never reach here.
             (old, new) if old == new => return Vec::new(),
             _ => AlertSeverity::Warning,
@@ -146,6 +156,10 @@ impl AlertEvaluator for AlertEngine {
             threshold,
             labels: key.labels().to_vec(),
         }]
+    }
+
+    fn active_alerts(&self) -> Vec<(AlertKey, AlertState)> {
+        self.tracker.active_alerts()
     }
 }
 
@@ -392,12 +406,21 @@ mod tests {
     }
 
     #[test]
-    fn memory_critical_to_warning_recovers() {
+    fn critical_to_warning_emits_warning_not_recovered() {
         let mut engine = AlertEngine::new(memory_rules());
         engine.evaluate(&snap(MetricKind::MemoryUsage, 96.0)); // -> Critical
-        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 88.0)); // -> Warning (recovered from Critical)
+        let events = engine.evaluate(&snap(MetricKind::MemoryUsage, 88.0)); // -> Warning
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+        assert_eq!(
+            events[0].severity,
+            AlertSeverity::Warning,
+            "a resource still above warning must not report Recovered"
+        );
+        assert_eq!(events[0].threshold, 85.0);
+
+        let recovered = engine.evaluate(&snap(MetricKind::MemoryUsage, 60.0)); // -> Normal
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].severity, AlertSeverity::Recovered);
     }
 
     #[test]
@@ -555,12 +578,12 @@ mod tests {
     }
 
     #[test]
-    fn disk_critical_to_warning_recovers() {
+    fn disk_critical_to_warning_deescalates_to_warning() {
         let mut engine = AlertEngine::new(disk_rules());
         engine.evaluate(&snap(MetricKind::DiskUsage, 92.0)); // -> Critical
-        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 85.0)); // -> Warning (Recovered from Critical)
+        let events = engine.evaluate(&snap(MetricKind::DiskUsage, 85.0)); // -> Warning
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].severity, AlertSeverity::Recovered);
+        assert_eq!(events[0].severity, AlertSeverity::Warning);
     }
 
     #[test]

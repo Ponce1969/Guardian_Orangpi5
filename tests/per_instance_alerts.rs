@@ -96,3 +96,85 @@ fn an_alert_names_the_instance_it_is_about() {
         events[0].message
     );
 }
+
+#[test]
+fn collector_telemetry_labels_deduplicate_and_recover() {
+    use guardian_rs::alerts::AlertSeverity;
+
+    let mut engine = AlertEngine::new(vec![
+        ThresholdRule {
+            metric: MetricKind::MemoryUsage,
+            warning: 85.0,
+            critical: 95.0,
+        },
+        ThresholdRule {
+            metric: MetricKind::DiskUsage,
+            warning: 80.0,
+            critical: 90.0,
+        },
+        ThresholdRule {
+            metric: MetricKind::DockerUnhealthyContainers,
+            warning: 1.0,
+            critical: 2.0,
+        },
+    ]);
+
+    // Memory collector attaches volatile `available_kb` on every tick.
+    let mem_tick_1 = MetricSnapshot::new(MetricKind::MemoryUsage, 88.0)
+        .with_label("total_kb", "16000000")
+        .with_label("available_kb", "1920000");
+    let mem_tick_2 = MetricSnapshot::new(MetricKind::MemoryUsage, 89.0)
+        .with_label("total_kb", "16000000")
+        .with_label("available_kb", "1760000");
+    let mem_healthy = MetricSnapshot::new(MetricKind::MemoryUsage, 60.0)
+        .with_label("total_kb", "16000000")
+        .with_label("available_kb", "6400000");
+
+    assert_eq!(engine.evaluate(&mem_tick_1).len(), 1);
+    assert!(
+        engine.evaluate(&mem_tick_2).is_empty(),
+        "changing available_kb while still in Warning must not fire a duplicate alert"
+    );
+    let mem_recovered = engine.evaluate(&mem_healthy);
+    assert_eq!(mem_recovered.len(), 1);
+    assert_eq!(mem_recovered[0].severity, AlertSeverity::Recovered);
+
+    // Disk collector attaches static `mount` + volatile `available_bytes`.
+    let disk_warn_1 = MetricSnapshot::new(MetricKind::DiskUsage, 82.0)
+        .with_label("mount", "/")
+        .with_label("total_bytes", "100000000000")
+        .with_label("available_bytes", "18000000000");
+    let disk_warn_2 = MetricSnapshot::new(MetricKind::DiskUsage, 83.0)
+        .with_label("mount", "/")
+        .with_label("total_bytes", "100000000000")
+        .with_label("available_bytes", "17000000000");
+    let disk_ok = MetricSnapshot::new(MetricKind::DiskUsage, 50.0)
+        .with_label("mount", "/")
+        .with_label("total_bytes", "100000000000")
+        .with_label("available_bytes", "50000000000");
+
+    assert_eq!(engine.evaluate(&disk_warn_1).len(), 1);
+    assert!(engine.evaluate(&disk_warn_2).is_empty());
+    let disk_recovered = engine.evaluate(&disk_ok);
+    assert_eq!(disk_recovered.len(), 1);
+    assert_eq!(disk_recovered[0].severity, AlertSeverity::Recovered);
+
+    // Docker collector changes `running` and `unhealthy` labels when recovering.
+    let docker_sick = MetricSnapshot::new(MetricKind::DockerUnhealthyContainers, 1.0)
+        .with_label("total", "5")
+        .with_label("running", "4")
+        .with_label("unhealthy", "1");
+    let docker_healed = MetricSnapshot::new(MetricKind::DockerUnhealthyContainers, 0.0)
+        .with_label("total", "5")
+        .with_label("running", "5")
+        .with_label("unhealthy", "0");
+
+    assert_eq!(engine.evaluate(&docker_sick).len(), 1);
+    let docker_recovered = engine.evaluate(&docker_healed);
+    assert_eq!(docker_recovered.len(), 1);
+    assert_eq!(docker_recovered[0].severity, AlertSeverity::Recovered);
+    assert!(
+        engine.active_alerts().is_empty(),
+        "once all three series recover, zero active entries remain"
+    );
+}
