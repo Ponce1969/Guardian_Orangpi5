@@ -476,11 +476,11 @@ impl DiscordNotifier {
         priority: OutboxPriority,
         payload: serde_json::Value,
     ) -> Result<(), NotifierError> {
-        let already_queued = self
+        let (already_queued, has_backlog) = self
             .outbox
             .lock()
-            .map(|guard| guard.contains_key(&key))
-            .unwrap_or(false);
+            .map(|guard| (guard.contains_key(&key), !guard.is_empty()))
+            .unwrap_or((false, false));
 
         if already_queued {
             // Supersede first so we never send a stale transition ahead of the
@@ -503,12 +503,27 @@ impl DiscordNotifier {
             return self.flush().await;
         }
 
-        match self.dispatch_with_retries(&payload).await {
-            Ok(()) => {
-                // Opportunistically drain older unrelated entries while healthy.
-                let _ = self.flush().await;
-                Ok(())
+        // Drain any older queued notifications first so FIFO order is preserved
+        // when connectivity returns mid-cycle.
+        if has_backlog {
+            if let Err(flush_err) = self.flush().await {
+                if let Ok(mut guard) = self.outbox.lock() {
+                    let before = guard.dropped_count;
+                    guard.upsert(key, priority, payload, Utc::now());
+                    if guard.dropped_count > before {
+                        error!(
+                            dropped_total = guard.dropped_count,
+                            "Discord outbox capacity exceeded; oldest entry evicted"
+                        );
+                    }
+                }
+                self.persist_outbox().await;
+                return Err(flush_err);
             }
+        }
+
+        match self.dispatch_with_retries(&payload).await {
+            Ok(()) => Ok(()),
             Err(DispatchFailure::Permanent(error)) => Err(error),
             Err(DispatchFailure::Retryable { error, .. }) => {
                 if let Ok(mut guard) = self.outbox.lock() {

@@ -25,6 +25,7 @@ set -euo pipefail
 
 CONTAINER="${CONTAINER:-auditor_familiar_db}"
 PROTECTED_DB="${PROTECTED_DB:-auditor_familiar}"
+PASSWORD_ENV="${PASSWORD_ENV:-GUARDIAN_PG_AUDITOR_PASSWORD}"
 ENV_FILE="${ENV_FILE:-/opt/guardianrs/.env}"
 DUMP_DIR="${DUMP_DIR:-/var/backups/guardianrs/postgres}"
 
@@ -34,9 +35,15 @@ say() { printf '\n== %s\n' "$1"; }
 [ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE (needs the PostgreSQL password)"
 command -v docker >/dev/null || die "docker is not available"
 
-# shellcheck disable=SC1090
-PGPASSWORD="$(grep -E '^GUARDIAN_PG_PASSWORD=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
-[ -n "$PGPASSWORD" ] || die "GUARDIAN_PG_PASSWORD is empty in $ENV_FILE"
+read_env_var() {
+    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' || true
+}
+
+PGPASSWORD="$(read_env_var "$PASSWORD_ENV")"
+if [ -z "$PGPASSWORD" ] && [ "$PASSWORD_ENV" = "GUARDIAN_PG_AUDITOR_PASSWORD" ]; then
+    PGPASSWORD="$(read_env_var "GUARDIAN_PG_PASSWORD")"
+fi
+[ -n "$PGPASSWORD" ] || die "$PASSWORD_ENV is empty in $ENV_FILE"
 
 IMAGE="$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')"
 NETWORK="$(docker inspect "$CONTAINER" --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{end}}')"
@@ -51,19 +58,19 @@ DUMP="${1:-}"
 
 if [ -z "$DUMP" ]; then
     say "Locating the newest dump"
-    DUMP="$(docker run --rm -v "$DUMP_DIR:$DUMP_DIR:ro" --entrypoint sh "$IMAGE" \
-        -c "ls -1t '$DUMP_DIR'/*.dump 2>/dev/null | head -1")" \
+    DUMP="$(docker run --rm -e DUMP_DIR="$DUMP_DIR" -v "$DUMP_DIR:$DUMP_DIR:ro" --entrypoint sh "$IMAGE" \
+        -c 'ls -1t "$DUMP_DIR"/*.dump 2>/dev/null | head -1')" \
         || die "cannot list $DUMP_DIR"
     [ -n "$DUMP" ] || die "no .dump file in $DUMP_DIR"
 fi
 
-[ -f "$DUMP" ] || [ -n "$(docker run --rm -v "$DUMP:$DUMP:ro" --entrypoint sh "$IMAGE" \
-    -c "test -s '$DUMP' && echo present" 2>/dev/null)" ] \
+[ -f "$DUMP" ] || [ -n "$(docker run --rm -e DUMP_PATH="$DUMP" -v "$DUMP:$DUMP:ro" --entrypoint sh "$IMAGE" \
+    -c 'test -s "$DUMP_PATH" && echo present' 2>/dev/null)" ] \
     || die "$DUMP does not exist or is empty"
 
 say "Dump: $DUMP"
-docker run --rm -v "$DUMP:$DUMP:ro" --entrypoint sh "$IMAGE" \
-    -c "ls -l '$DUMP'" || true
+docker run --rm -e DUMP_PATH="$DUMP" -v "$DUMP:$DUMP:ro" --entrypoint sh "$IMAGE" \
+    -c 'ls -l "$DUMP_PATH"' || true
 
 # --- Target -----------------------------------------------------------------
 TEST_DB="auditor_restore_test_$(date +%Y%m%d%H%M%S)"

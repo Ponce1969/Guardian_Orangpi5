@@ -10,6 +10,8 @@ set -euo pipefail
 # === Constants ===
 SERVICE_NAME="guardianrs"
 INSTALL_DIR="/opt/guardianrs"
+BACKUP_DIR="/var/backups/guardianrs"
+STATE_DIR="/var/lib/guardianrs"
 BINARY_NAME="guardian-rs"
 SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -88,8 +90,11 @@ else
     log_warn "Config not found at ${CONFIG_SOURCE}, skipping"
 fi
 
-# === Copy .env file ===
-if [[ -f "$ENV_SOURCE" ]]; then
+# === Copy .env file without clobbering live production secrets ===
+if [[ -f "${INSTALL_DIR}/.env" && "${FORCE_ENV_OVERWRITE:-0}" != "1" ]]; then
+    log_info "Preserving existing ${INSTALL_DIR}/.env (set FORCE_ENV_OVERWRITE=1 to replace)"
+    chmod 600 "${INSTALL_DIR}/.env"
+elif [[ -f "$ENV_SOURCE" ]]; then
     log_info "Installing .env file..."
     cp "$ENV_SOURCE" "${INSTALL_DIR}/.env"
     chmod 600 "${INSTALL_DIR}/.env"
@@ -98,9 +103,12 @@ else
     log_warn ".env not found at ${ENV_SOURCE}, skipping (service will use system env vars)"
 fi
 
-# === Set ownership ===
+# === Set ownership and create 0700 state/backup directories (I5.2) ===
 chown -R "${SERVICE_NAME}:${SERVICE_NAME}" "$INSTALL_DIR"
-log_info "Ownership set to ${SERVICE_NAME}:${SERVICE_NAME}"
+mkdir -p "${BACKUP_DIR}/postgres" "$STATE_DIR"
+chown -R "${SERVICE_NAME}:${SERVICE_NAME}" "$BACKUP_DIR" "$STATE_DIR"
+chmod 700 "$BACKUP_DIR" "${BACKUP_DIR}/postgres" "$STATE_DIR"
+log_info "Ownership and 0700 permissions set on ${INSTALL_DIR}, ${BACKUP_DIR}, and ${STATE_DIR}"
 
 # === Install systemd unit ===
 if [[ ! -f "$SYSTEMD_SOURCE" ]]; then

@@ -34,7 +34,7 @@ fi
 command -v psql >/dev/null || { printf 'error: psql is not installed\n' >&2; exit 2; }
 
 read_var() {
-    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-
+    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r'
 }
 
 port_open() {
