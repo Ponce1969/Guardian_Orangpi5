@@ -138,15 +138,28 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Execute one full cycle: the metric pipeline, then at most one maintenance
-    /// task.
+    /// Execute one full cycle across fault-isolated phases (`I2.3`):
     ///
-    /// Maintenance runs outside the metric pipeline on purpose. Folding it inside
-    /// would mean a tick that collected no metrics also skipped a due backup,
-    /// which is the opposite of what a backup schedule promises.
+    /// 1. metric collection and alert evaluation;
+    /// 2. at most one due maintenance task;
+    /// 3. outbound transport flush (always runs, even when collection failed,
+    ///    startup grace deferred evaluation, or no new events fired).
     async fn tick(&mut self, tick: u64, shutdown: &mut watch::Receiver<bool>) {
         self.collect_and_alert().await;
         self.maintain(shutdown, tick).await;
+        self.flush_notifications().await;
+    }
+
+    async fn flush_notifications(&mut self) {
+        for notifier in &self.notifiers {
+            if let Err(error) = notifier.flush().await {
+                error!(
+                    notifier = notifier.name(),
+                    error = %error,
+                    "Notification outbox flush failed"
+                );
+            }
+        }
     }
 
     /// Run at most one due maintenance task and dispatch its outcome.
@@ -546,6 +559,7 @@ mod tests {
     struct Recorder {
         outcomes: Arc<Mutex<Vec<MaintenanceOutcome>>>,
         alerts: Arc<Mutex<usize>>,
+        flushes: Arc<Mutex<usize>>,
     }
 
     #[async_trait]
@@ -564,6 +578,11 @@ mod tests {
             outcome: &MaintenanceOutcome,
         ) -> Result<(), NotifierError> {
             self.outcomes.lock().expect("lock").push(outcome.clone());
+            Ok(())
+        }
+
+        async fn flush(&self) -> Result<(), NotifierError> {
+            *self.flushes.lock().expect("lock") += 1;
             Ok(())
         }
     }
@@ -742,6 +761,54 @@ mod tests {
             *alerts.lock().expect("lock"),
             1,
             "outside the window the transition is reported"
+        );
+    }
+
+    struct BrokenCollector;
+
+    #[async_trait]
+    impl Collector for BrokenCollector {
+        fn name(&self) -> &str {
+            "broken"
+        }
+
+        async fn collect(&self) -> Result<MetricSnapshot, CollectorError> {
+            Err(CollectorError::ReadFailed {
+                metric: "cpu_usage".to_string(),
+                source: std::io::Error::other("proc unreadable"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_runs_even_when_collectors_fail_or_emit_no_events() {
+        let recorder = Recorder::default();
+        let flushes = Arc::clone(&recorder.flushes);
+
+        let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: vec![Box::new(BrokenCollector)],
+            alert_engine: Box::new(hot_cpu_engine()),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::default(),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+            state_path: None,
+            startup_grace: Duration::ZERO,
+        });
+
+        let (_tx, mut rx) = watch::channel(false);
+        // Tick 1: collector fails (`snapshots.is_empty()`), yet flush MUST run.
+        orchestrator.tick(1, &mut rx).await;
+        assert_eq!(*flushes.lock().expect("lock"), 1);
+
+        // Replace with a steady-state collector: Tick 2 fires Critical, Tick 3 emits 0 events.
+        orchestrator.collectors = vec![Box::new(HotCpu)];
+        orchestrator.tick(2, &mut rx).await;
+        orchestrator.tick(3, &mut rx).await;
+        assert_eq!(
+            *flushes.lock().expect("lock"),
+            3,
+            "flush must execute as its own phase on every tick"
         );
     }
 

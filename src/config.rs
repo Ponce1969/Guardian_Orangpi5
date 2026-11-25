@@ -370,6 +370,8 @@ pub struct DiscordConfig {
     /// Name of the environment variable holding the webhook URL.
     /// The URL itself is never stored in YAML or code.
     pub webhook_url_env: String,
+    /// Optional durable outbox path for queued notifications (`I2.2`).
+    pub outbox_path: Option<String>,
     /// Resolved webhook URL, populated from the environment during config load.
     /// Not deserialized from YAML — secrets never touch the config file.
     resolved_webhook_url: Option<String>,
@@ -380,6 +382,7 @@ impl std::fmt::Debug for DiscordConfig {
         f.debug_struct("DiscordConfig")
             .field("enabled", &self.enabled)
             .field("webhook_url_env", &self.webhook_url_env)
+            .field("outbox_path", &self.outbox_path)
             .field("resolved_webhook_url", &"***")
             .finish()
     }
@@ -394,12 +397,15 @@ impl<'de> Deserialize<'de> for DiscordConfig {
         struct Raw {
             enabled: bool,
             webhook_url_env: String,
+            #[serde(default)]
+            outbox_path: Option<String>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
         Ok(DiscordConfig {
             enabled: raw.enabled,
             webhook_url_env: raw.webhook_url_env,
+            outbox_path: raw.outbox_path,
             resolved_webhook_url: None,
         })
     }
@@ -832,6 +838,7 @@ notification:
         let config = DiscordConfig {
             enabled: false,
             webhook_url_env: "DISCORD_WEBHOOK_URL".to_string(),
+            outbox_path: None,
             resolved_webhook_url: None,
         };
 

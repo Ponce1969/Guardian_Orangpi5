@@ -1,8 +1,10 @@
 pub mod discord;
 pub mod log;
+pub mod outbox;
 
 pub use discord::DiscordNotifier;
 pub use log::LogNotifier;
+pub use outbox::{DeliveryOutbox, OutboxEntry, OutboxKey, OutboxPriority};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -57,4 +59,12 @@ pub trait Notifier: Send + Sync {
         &self,
         outcome: &crate::services::maintenance::MaintenanceOutcome,
     ) -> Result<(), NotifierError>;
+
+    /// Drain any queued outbound messages whose previous delivery failed due to
+    /// transient network or remote endpoint errors (`I2.3`).
+    ///
+    /// Stateless local notifiers (`LogNotifier`) default to a no-op.
+    async fn flush(&self) -> Result<(), NotifierError> {
+        Ok(())
+    }
 }

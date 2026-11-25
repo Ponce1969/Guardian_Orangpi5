@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// The kind of infrastructure metric being measured.
 ///
 /// Each variant corresponds to exactly one type of measurement.
 /// Labels provide additional context (e.g., mount point for disk, zone for temperature).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MetricKind {
     CpuUsage,
     MemoryUsage,

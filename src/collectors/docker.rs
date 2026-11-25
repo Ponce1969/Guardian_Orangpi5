@@ -14,11 +14,19 @@
 //! logs and retries on the next cycle. A daemon that answers the container list
 //! but not the disk query still reports container health.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::collectors::{Collector, CollectorError};
 use crate::metrics::{MetricKind, MetricSnapshot};
+
+/// Default deadline for listing Docker containers (`I2.1`).
+pub const DOCKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default deadline for scanning Docker disk usage (`I2.1`).
+pub const DOCKER_DF_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The state of one container, reduced to what the guardian reacts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,23 +203,31 @@ impl Collector for DockerCollector {
 
     /// Report container health and disk usage from a single connection.
     async fn collect_all(&self) -> Result<Vec<MetricSnapshot>, CollectorError> {
-        let containers =
-            self.api
-                .containers()
-                .await
-                .map_err(|reason| CollectorError::Unavailable {
-                    name: "docker".to_string(),
-                    reason,
-                })?;
+        let containers = tokio::time::timeout(DOCKER_LIST_TIMEOUT, self.api.containers())
+            .await
+            .map_err(|_| CollectorError::Unavailable {
+                name: "docker".to_string(),
+                reason: format!("docker list_containers timed out after {DOCKER_LIST_TIMEOUT:?}"),
+            })?
+            .map_err(|reason| CollectorError::Unavailable {
+                name: "docker".to_string(),
+                reason,
+            })?;
 
         let mut snapshots = vec![Self::containers_snapshot(&containers)];
 
         // Disk usage is secondary: a daemon that answers the container list but
         // not the disk query still leaves the operator with the health signal.
-        match self.api.disk_usage().await {
-            Ok(usage) => snapshots.push(Self::disk_snapshot(&usage)),
-            Err(reason) => {
+        match tokio::time::timeout(DOCKER_DF_TIMEOUT, self.api.disk_usage()).await {
+            Ok(Ok(usage)) => snapshots.push(Self::disk_snapshot(&usage)),
+            Ok(Err(reason)) => {
                 warn!(reason = %reason, "Docker disk usage unavailable this cycle");
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = DOCKER_DF_TIMEOUT.as_secs(),
+                    "Docker disk usage timed out this cycle"
+                );
             }
         }
 

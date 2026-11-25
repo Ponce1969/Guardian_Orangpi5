@@ -113,7 +113,25 @@ fn main() -> Result<()> {
         let hostname = gethostname::gethostname()
             .into_string()
             .unwrap_or_else(|_| "unknown".to_string());
-        let discord = DiscordNotifier::new(webhook_url, hostname);
+        let outbox_path = config
+            .notification
+            .discord
+            .outbox_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                config
+                    .maintenance
+                    .state_path
+                    .as_ref()
+                    .and_then(|state| std::path::Path::new(state).parent())
+                    .map(|dir| dir.join("outbox.json"))
+            });
+
+        let mut discord = DiscordNotifier::new(webhook_url, hostname);
+        if let Some(path) = outbox_path {
+            discord = discord.with_outbox_path(path);
+        }
         notifiers.push(Box::new(discord));
         info!("Discord notifier enabled");
     } else {

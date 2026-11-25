@@ -13,6 +13,8 @@
 //! Credentials never reach this file's output. The password lives inside the
 //! adapter's client config and is never placed in a snapshot label.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
@@ -21,6 +23,9 @@ use crate::metrics::{MetricKind, MetricSnapshot};
 
 /// Probes attempted per cycle before the database is considered unreachable.
 pub const MAX_PROBES: usize = 3;
+
+/// Default deadline for one full connectivity probe (`connect` + `SELECT 1`).
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The single PostgreSQL operation this collector needs.
 ///
@@ -45,6 +50,7 @@ pub struct PostgresCollector {
     instance: String,
     host: String,
     database: String,
+    probe_timeout: Duration,
 }
 
 impl PostgresCollector {
@@ -56,6 +62,7 @@ impl PostgresCollector {
     /// configuration was not loaded through [`crate::config::load`].
     pub fn from_config(config: &crate::config::PostgresInstanceConfig) -> Result<Self, String> {
         let password = config.password().map_err(|e| e.to_string())?;
+        let probe_timeout = Duration::from_secs(config.connect_timeout_secs);
 
         let mut pg = tokio_postgres::Config::new();
         pg.host(&config.host)
@@ -63,13 +70,14 @@ impl PostgresCollector {
             .user(&config.user)
             .dbname(&config.database)
             .password(password)
-            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs));
+            .connect_timeout(probe_timeout);
 
         Ok(Self {
             api: Box::new(TokioPostgres { config: pg }),
             instance: config.name.clone(),
             host: config.host.clone(),
             database: config.database.clone(),
+            probe_timeout,
         })
     }
 
@@ -84,22 +92,38 @@ impl PostgresCollector {
             instance: database.to_string(),
             host: host.to_string(),
             database: database.to_string(),
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
         }
+    }
+
+    /// Override the full-probe deadline (`connect` + `SELECT 1`).
+    pub fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.probe_timeout = timeout;
+        self
     }
 
     /// Probe until one succeeds or the budget is spent, returning the number of
     /// failures.
     async fn count_failed_probes(&self) -> f64 {
         for attempt in 0..MAX_PROBES {
-            match self.api.probe().await {
+            let outcome = tokio::time::timeout(self.probe_timeout, self.api.probe()).await;
+            match outcome {
                 // Probing stops here: a healthy database costs one connection.
-                Ok(()) => return attempt as f64,
-                Err(reason) => {
+                Ok(Ok(())) => return attempt as f64,
+                Ok(Err(reason)) => {
                     debug!(
                         attempt = attempt + 1,
                         probes = MAX_PROBES,
                         reason = %reason,
                         "PostgreSQL probe failed"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        probes = MAX_PROBES,
+                        timeout_ms = self.probe_timeout.as_millis(),
+                        "PostgreSQL probe timed out"
                     );
                 }
             }
@@ -312,5 +336,28 @@ mod tests {
         let collector = collector_with(&script);
 
         assert!(collector.collect().await.is_ok());
+    }
+
+    struct StalledPostgres;
+
+    #[async_trait]
+    impl PostgresApi for StalledPostgres {
+        async fn probe(&self) -> Result<(), String> {
+            std::future::pending::<Result<(), String>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_query_times_out_as_failed_probe() {
+        let collector =
+            PostgresCollector::with_api(Box::new(StalledPostgres), "127.0.0.1", "auditor")
+                .with_probe_timeout(Duration::from_millis(20));
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), collector.collect())
+            .await
+            .expect("full probe deadline must prevent hanging")
+            .expect("collect never fails");
+
+        assert_eq!(snapshot.value, MAX_PROBES as f64);
     }
 }
