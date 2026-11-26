@@ -82,18 +82,37 @@ impl BackupTask {
             self.verify_timeout,
         );
 
-        if let Err(error) = std::fs::create_dir_all(&self.destination) {
-            return self.outcome(
-                started,
-                MaintenanceStatus::Failed,
-                None,
-                &format!("cannot create {}: {error}", self.destination.display()),
-            );
-        }
+        let dest = self.destination.clone();
+        let database = self.settings.database.clone();
+        let active_partial = plan.partial.clone();
+        let prep = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+            std::fs::create_dir_all(&dest)?;
+            // Sweep any stale `.dump.partial` files left for this database by a prior
+            // crash or SIGKILL before writing a new partial archive (`I4.1`).
+            sweep_stale_partials_sync(&dest, &database, &active_partial);
+            Ok(())
+        })
+        .await;
 
-        // Sweep any stale `.dump.partial` files left for this database by a prior
-        // crash or SIGKILL before writing a new partial archive (`I4.1`).
-        self.sweep_stale_partials(&plan.partial);
+        match prep {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return self.outcome(
+                    started,
+                    MaintenanceStatus::Failed,
+                    None,
+                    &format!("cannot create {}: {error}", self.destination.display()),
+                );
+            }
+            Err(error) => {
+                return self.outcome(
+                    started,
+                    MaintenanceStatus::Failed,
+                    None,
+                    &format!("backup preparation task failed: {error}"),
+                );
+            }
+        }
 
         // 1. The dump itself.
         let dump = match executor.run(&plan.dump).await {
@@ -109,7 +128,7 @@ impl BackupTask {
                 );
             }
             Err(ExecutionError::Collect { reason }) => {
-                self.discard(&plan);
+                self.discard(&plan).await;
                 return self.outcome(
                     started,
                     MaintenanceStatus::Failed,
@@ -123,18 +142,23 @@ impl BackupTask {
 
         let dump_status = classify_execution(&dump);
         if dump_status != MaintenanceStatus::Success {
-            self.discard(&plan);
+            self.discard(&plan).await;
             return self.outcome(started, dump_status, dump.exit_code, &self.detail(&dump));
         }
 
         // 2. The file it claims to have written. An exit code of zero is not
         // evidence that bytes reached the disk.
-        let bytes = std::fs::metadata(&plan.partial)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let partial_for_meta = plan.partial.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&partial_for_meta)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
 
         if bytes == 0 {
-            self.discard(&plan);
+            self.discard(&plan).await;
             return self.outcome(
                 started,
                 MaintenanceStatus::Failed,
@@ -147,7 +171,7 @@ impl BackupTask {
         let verify = match executor.run(&plan.verify).await {
             Ok(output) => output,
             Err(ExecutionError::Spawn { reason, .. }) => {
-                self.discard(&plan);
+                self.discard(&plan).await;
                 return self.outcome(
                     started,
                     MaintenanceStatus::Failed,
@@ -158,7 +182,7 @@ impl BackupTask {
                 );
             }
             Err(ExecutionError::Collect { reason }) => {
-                self.discard(&plan);
+                self.discard(&plan).await;
                 return self.outcome(
                     started,
                     MaintenanceStatus::Failed,
@@ -170,11 +194,12 @@ impl BackupTask {
             }
         };
 
-        if classify_execution(&verify) != MaintenanceStatus::Success {
-            self.discard(&plan);
+        let verify_status = classify_execution(&verify);
+        if verify_status != MaintenanceStatus::Success {
+            self.discard(&plan).await;
             return self.outcome(
                 started,
-                MaintenanceStatus::Failed,
+                verify_status,
                 verify.exit_code,
                 &format!(
                     "the dump is not a readable archive: {}",
@@ -186,7 +211,7 @@ impl BackupTask {
         let restore = match executor.run(&plan.restore).await {
             Ok(output) => output,
             Err(error) => {
-                self.discard(&plan);
+                self.discard(&plan).await;
                 let reason = match error {
                     ExecutionError::Spawn { reason, .. } | ExecutionError::Collect { reason } => {
                         reason
@@ -201,29 +226,55 @@ impl BackupTask {
             }
         };
 
-        if classify_execution(&restore) != MaintenanceStatus::Success {
-            self.discard(&plan);
+        let restore_status = classify_execution(&restore);
+        if restore_status != MaintenanceStatus::Success {
+            self.discard(&plan).await;
             return self.outcome(
                 started,
-                MaintenanceStatus::Failed,
+                restore_status,
                 restore.exit_code,
                 &format!("the dump is not restorable: {}", self.detail(&restore)),
             );
         }
 
-        if let Err(error) = std::fs::rename(&plan.partial, &plan.destination) {
-            self.discard(&plan);
-            return self.outcome(
-                started,
-                MaintenanceStatus::Failed,
-                None,
-                &format!("cannot publish the backup: {error}"),
-            );
-        }
+        // 4. Atomic publish + retention on the blocking pool (`AGENTS.md`: no
+        // blocking filesystem I/O inside async Tokio tasks).
+        let partial_to_publish = plan.partial.clone();
+        let final_destination = plan.destination.clone();
+        let task_for_prune = self.clone();
+        let publish_and_prune = tokio::task::spawn_blocking(
+            move || -> Result<Result<usize, String>, std::io::Error> {
+                if let Err(error) = std::fs::rename(&partial_to_publish, &final_destination) {
+                    let _ = std::fs::remove_file(&partial_to_publish);
+                    return Err(error);
+                }
+                Ok(task_for_prune.prune())
+            },
+        )
+        .await;
 
-        // 4. Retention, and only now. Pruning before the replacement is proven is
-        // how a working backup gets deleted by a broken one.
-        let detail = match self.prune() {
+        let prune_result = match publish_and_prune {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                return self.outcome(
+                    started,
+                    MaintenanceStatus::Failed,
+                    None,
+                    &format!("cannot publish the backup: {error}"),
+                );
+            }
+            Err(error) => {
+                self.discard(&plan).await;
+                return self.outcome(
+                    started,
+                    MaintenanceStatus::Failed,
+                    None,
+                    &format!("backup publish task failed: {error}"),
+                );
+            }
+        };
+
+        let detail = match prune_result {
             Ok(0) => String::new(),
             Ok(count) => format!("pruned {count} older backup(s)"),
             // The backup is valid; a pruning failure is a separate problem and
@@ -263,30 +314,13 @@ impl BackupTask {
         }
     }
 
-    /// Remove whatever a failed run may have left behind.
-    fn discard(&self, plan: &BackupPlan) {
-        let _ = std::fs::remove_file(&plan.partial);
-    }
-
-    /// Remove stale `.dump.partial` files for this database from earlier crashes,
-    /// leaving the current run's `active_partial` untouched so pre-seeded test
-    /// fixtures and live partial targets are preserved until `pg_dump` runs.
-    fn sweep_stale_partials(&self, active_partial: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(&self.destination) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path == active_partial {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if belongs_to_database_partial(name, &self.settings.database) {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
+    /// Remove whatever a failed run may have left behind without blocking the async worker.
+    async fn discard(&self, plan: &BackupPlan) {
+        let partial = plan.partial.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_file(partial);
+        })
+        .await;
     }
 
     /// Delete the backups beyond the retention limit, returning how many went.
@@ -314,6 +348,31 @@ impl BackupTask {
         }
 
         Ok(doomed.len())
+    }
+}
+
+/// Remove stale `.dump.partial` files for `database` from earlier crashes,
+/// leaving the current run's `active_partial` untouched so pre-seeded test
+/// fixtures and live partial targets are preserved until `pg_dump` runs.
+fn sweep_stale_partials_sync(
+    destination: &std::path::Path,
+    database: &str,
+    active_partial: &std::path::Path,
+) {
+    let Ok(entries) = std::fs::read_dir(destination) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == active_partial {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if belongs_to_database_partial(name, database) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -855,6 +914,25 @@ mod tests {
             outcome.detail
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_restore_verification_reports_timed_out_status() {
+        let dir = scratch_dir("restore-timeout");
+        let task = task_in(&dir, 7);
+        write_dump(&task, now(), b"large archive");
+        let timed_out_restore = ExecutionOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: "killed after deadline".to_string(),
+            timed_out: true,
+        };
+        let (executor, _) = executor_with(vec![Ok(ok(0)), Ok(ok(0)), Ok(timed_out_restore)]);
+
+        let outcome = task.run(&executor, now()).await;
+
+        assert_eq!(outcome.status, MaintenanceStatus::TimedOut);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

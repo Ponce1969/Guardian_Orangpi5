@@ -262,16 +262,19 @@ pub fn plan_dump(
         "pg_restore",
         vec!["--list".to_string(), partial_arg.clone()],
         verify_timeout,
-    );
+    )
+    .with_grace(grace);
 
     // Stream decompressed SQL to `-` (stdout) while attaching stdout to the OS
     // null device (`I4.1`): every compressed block is verified in memory without
     // 5x-10x disk write amplification or cleartext SQL files on flash storage.
+    // Full archive decompression scales with database size, so it uses `timeout`.
     let restore = ExecutionRequest::new(
         "pg_restore",
         vec!["--file".to_string(), "-".to_string(), partial_arg],
-        verify_timeout,
+        timeout,
     )
+    .with_grace(grace)
     .with_discarded_stdout();
 
     BackupPlan {
@@ -591,5 +594,9 @@ mod tests {
 
         assert_eq!(plan.dump.timeout(), std::time::Duration::from_secs(1800));
         assert_eq!(plan.dump.grace(), std::time::Duration::from_secs(30));
+        assert_eq!(plan.verify.timeout(), std::time::Duration::from_secs(60));
+        assert_eq!(plan.verify.grace(), std::time::Duration::from_secs(30));
+        assert_eq!(plan.restore.timeout(), std::time::Duration::from_secs(1800));
+        assert_eq!(plan.restore.grace(), std::time::Duration::from_secs(30));
     }
 }

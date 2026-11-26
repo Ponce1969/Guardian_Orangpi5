@@ -30,6 +30,8 @@ pub struct MaintenanceState {
     version: u32,
     #[serde(default)]
     tasks: Vec<TaskState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previous_tasks: Vec<TaskState>,
     #[serde(default)]
     last_digest_date: Option<NaiveDate>,
 }
@@ -50,6 +52,7 @@ impl Default for MaintenanceState {
         Self {
             version: FORMAT_VERSION,
             tasks: Vec::new(),
+            previous_tasks: Vec::new(),
             last_digest_date: None,
         }
     }
@@ -61,8 +64,23 @@ impl MaintenanceState {
         Self {
             version: FORMAT_VERSION,
             tasks,
+            previous_tasks: Vec::new(),
             last_digest_date: None,
         }
+    }
+
+    /// Attach prior successful runs so catch-up digests survive an early next-day run.
+    pub fn with_previous_tasks(mut self, previous_tasks: Vec<TaskState>) -> Self {
+        self.previous_tasks = previous_tasks;
+        self
+    }
+
+    /// The prior successful run recorded for `name` before the latest one, if any.
+    pub fn previous_run(&self, name: &str) -> Option<NaiveDateTime> {
+        self.previous_tasks
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.last_run)
     }
 
     /// Attach the most recent local calendar date for which the daily digest ran.
@@ -143,14 +161,18 @@ pub fn save(path: &Path, state: &MaintenanceState) -> Result<(), String> {
         .map_err(|error| format!("cannot encode maintenance state: {error}"))?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
     }
 
     // Written beside the target, flushed and synced, and only then renamed: a
     // rename that reaches the disk ahead of the data it names leaves a zero-length
     // record, which reads as corrupt exactly when the record matters most.
-    let temp = path.with_extension("json.tmp");
+    let mut temp_os = path.as_os_str().to_os_string();
+    temp_os.push(".tmp");
+    let temp = std::path::PathBuf::from(temp_os);
 
     let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
@@ -179,7 +201,12 @@ pub fn save(path: &Path, state: &MaintenanceState) -> Result<(), String> {
 #[cfg(unix)]
 fn sync_parent(path: &Path) {
     if let Some(parent) = path.parent() {
-        if let Ok(directory) = std::fs::File::open(parent) {
+        let dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(directory) = std::fs::File::open(dir) {
             let _ = directory.sync_all();
         }
     }

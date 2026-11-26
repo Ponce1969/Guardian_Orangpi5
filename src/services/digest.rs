@@ -7,13 +7,26 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Days, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Days, MappedLocalTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 
 use crate::alerts::{AlertKey, AlertState};
-use crate::services::maintenance::{DailyTime, MaintenanceStatus, ScheduledTask};
+use crate::services::maintenance::{DailyTime, MaintenanceStatus, ScheduledTask, TaskSchedule};
 
 /// Grace window past `daily_at` before a digest is marked as late catch-up.
 pub const DEFAULT_LATE_GRACE: Duration = Duration::from_secs(300);
+
+/// Discord rejects any embed field `value` exceeding 1024 characters with HTTP 400.
+pub const MAX_DISCORD_FIELD_CHARS: usize = 1024;
+
+fn cap_discord_field(text: String) -> String {
+    if text.chars().count() <= MAX_DISCORD_FIELD_CHARS {
+        return text;
+    }
+    const SUFFIX: &str = "\n… (truncated)";
+    let budget = MAX_DISCORD_FIELD_CHARS.saturating_sub(SUFFIX.chars().count());
+    let prefix: String = text.chars().take(budget).collect();
+    format!("{prefix}{SUFFIX}")
+}
 
 /// Why and for which local calendar date a digest is firing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,11 +93,13 @@ impl DigestReport {
             return "No collector failures".to_string();
         }
 
-        self.collector_failures
+        let rendered = self
+            .collector_failures
             .iter()
             .map(|(name, count)| format!("• `{name}`: {count} failure(s)"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        cap_discord_field(rendered)
     }
 
     /// Format currently open alerts.
@@ -93,7 +108,8 @@ impl DigestReport {
             return "No open alerts".to_string();
         }
 
-        self.open_alerts
+        let rendered = self
+            .open_alerts
             .iter()
             .map(|alert| {
                 let badge = match alert.state {
@@ -104,7 +120,8 @@ impl DigestReport {
                 format!("• {badge} — `{}`", alert.series)
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        cap_discord_field(rendered)
     }
 
     /// Format one explicit line per configured maintenance task (`I4.2`).
@@ -113,7 +130,8 @@ impl DigestReport {
             return "Maintenance disabled".to_string();
         }
 
-        self.tasks
+        let rendered = self
+            .tasks
             .iter()
             .map(|task| match &task.state {
                 DigestTaskState::Succeeded { ran_at } => {
@@ -130,7 +148,8 @@ impl DigestReport {
                 }
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        cap_discord_field(rendered)
     }
 
     /// Overall severity rank (`2` = critical, `1` = degraded/late, `0` = healthy).
@@ -181,22 +200,52 @@ pub fn format_alert_series(key: &AlertKey) -> String {
     format!("{} ({labels})", key.kind().display_name())
 }
 
-/// Summarise configured maintenance tasks for `target_date`.
+/// Summarise configured maintenance tasks anchored to `target_date` and `digest_at`.
 ///
-/// Assumes the overnight window closed before `daily_at` (within the preceding
-/// 24 hours). Any task that did not run inside that window or whose status was
-/// `Skipped` is reported explicitly as `PendingOrDidNotRun` (`I4.2`).
+/// - For `TaskSchedule::DailyAt(task_at)`, the expected scheduled slot is
+///   `target_date.and_time(task_at)` when `task_at <= digest_at`, or the preceding
+///   day's `task_at` when `task_at > digest_at`. A recorded run counts iff it occurred
+///   at or after `expected_slot` (and within 24 hours of it), preventing yesterday's
+///   late catch-up run from masquerading as today's overnight backup (`I4.2`).
+/// - For `TaskSchedule::Every(_)`, the window spans from the previous day's
+///   `digest_at` through the end of `target_date`.
 pub fn summarize_tasks(
     tasks: &[ScheduledTask],
-    now_local: NaiveDateTime,
+    target_date: NaiveDate,
+    digest_at: DailyTime,
 ) -> Vec<DigestTaskSummary> {
-    let window_start = now_local - chrono::TimeDelta::hours(24);
+    let prev_date = target_date
+        .checked_sub_days(Days::new(1))
+        .unwrap_or(target_date);
+    let every_start = prev_date.and_time(digest_at.time());
+    let every_end = target_date
+        .checked_add_days(Days::new(1))
+        .and_then(|next| next.and_hms_opt(0, 0, 0))
+        .unwrap_or_else(|| target_date.and_time(digest_at.time()));
 
     tasks
         .iter()
         .map(|task| {
-            let state = match (task.last_run_wall(), task.last_status()) {
-                (Some(when), Some(status)) if when >= window_start => {
+            let in_window = |when: NaiveDateTime| match task.schedule {
+                TaskSchedule::DailyAt(task_at) => {
+                    let slot_date = if task_at.time() <= digest_at.time() {
+                        target_date
+                    } else {
+                        prev_date
+                    };
+                    let expected_slot = slot_date.and_time(task_at.time());
+                    when >= expected_slot && when < expected_slot + TimeDelta::hours(24)
+                }
+                TaskSchedule::Every(_) => when > every_start && when <= every_end,
+            };
+
+            let state = match task
+                .recent_runs()
+                .iter()
+                .rev()
+                .find(|(when, _)| in_window(*when))
+            {
+                Some((when, status)) => {
                     let stamp = when.format("%H:%M").to_string();
                     match status {
                         MaintenanceStatus::Success => DigestTaskState::Succeeded { ran_at: stamp },
@@ -205,7 +254,7 @@ pub fn summarize_tasks(
                         MaintenanceStatus::Skipped => DigestTaskState::PendingOrDidNotRun,
                     }
                 }
-                _ => DigestTaskState::PendingOrDidNotRun,
+                None => DigestTaskState::PendingOrDidNotRun,
             };
 
             DigestTaskSummary {
@@ -575,7 +624,8 @@ mod tests {
         );
         // Task 2 (`ecommerce_nightly`) never ran at all!
 
-        let tasks = summarize_tasks(scheduler.tasks(), now_local);
+        let digest_at = DailyTime::new(8, 0).expect("08:00");
+        let tasks = summarize_tasks(scheduler.tasks(), now_local.date(), digest_at);
         let healthy_collectors_report = DigestReport {
             generated_at: Utc::now(),
             local_offset: "-03:00".to_string(),
@@ -611,6 +661,135 @@ mod tests {
         assert_eq!(
             with_collector_failure.format_collectors(),
             "• `temperature`: 4 failure(s)"
+        );
+    }
+
+    #[test]
+    fn yesterdays_late_catchup_run_does_not_satisfy_todays_digest_slot() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 25).expect("today");
+        let yesterday_catchup = NaiveDate::from_ymd_opt(2026, 11, 24)
+            .and_then(|d| d.and_hms_opt(9, 0, 0))
+            .expect("yesterday 09:00");
+
+        let mut scheduler =
+            crate::services::maintenance::MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "auditor_nightly",
+                TaskSchedule::DailyAt(DailyTime::new(3, 30).expect("03:30")),
+            )]);
+        scheduler.record(
+            0,
+            MaintenanceStatus::Success,
+            yesterday_catchup,
+            std::time::Instant::now(),
+        );
+
+        let digest_at = DailyTime::new(8, 0).expect("08:00");
+        let tasks = summarize_tasks(scheduler.tasks(), today, digest_at);
+        let report = DigestReport {
+            generated_at: Utc::now(),
+            local_offset: "-03:00".to_string(),
+            target_date: today,
+            scheduled_slot: "2026-11-25 08:00 -03:00".to_string(),
+            late_by: None,
+            collector_failures: Vec::new(),
+            open_alerts: Vec::new(),
+            tasks,
+        };
+
+        let rendered = report.format_tasks();
+        assert!(
+            rendered.contains("`auditor_nightly` — pending / did not run"),
+            "yesterday's 09:00 catch-up must not satisfy today's 03:30 slot: {rendered}"
+        );
+    }
+
+    #[test]
+    fn digest_fields_are_capped_to_discord_1024_char_limit() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 25).expect("today");
+        let report = DigestReport {
+            generated_at: Utc::now(),
+            local_offset: "+00:00".to_string(),
+            target_date: today,
+            scheduled_slot: "2026-11-25 08:00 +00:00".to_string(),
+            late_by: None,
+            collector_failures: (0..80)
+                .map(|i| (format!("collector_instance_number_{i}"), 3))
+                .collect(),
+            open_alerts: (0..80)
+                .map(|i| DigestAlertSummary {
+                    series: format!("PostgreSQL Probe Failures (instance=database_replica_{i})"),
+                    state: AlertState::Critical,
+                })
+                .collect(),
+            tasks: (0..80)
+                .map(|i| DigestTaskSummary {
+                    name: format!("nightly_backup_task_for_project_{i}"),
+                    state: DigestTaskState::PendingOrDidNotRun,
+                })
+                .collect(),
+        };
+
+        assert!(report.format_collectors().chars().count() <= MAX_DISCORD_FIELD_CHARS);
+        assert!(report.format_open_alerts().chars().count() <= MAX_DISCORD_FIELD_CHARS);
+        assert!(report.format_tasks().chars().count() <= MAX_DISCORD_FIELD_CHARS);
+    }
+
+    #[test]
+    fn yesterdays_catchup_digest_preserves_yesterdays_backup_after_todays_early_run() {
+        let day1 = NaiveDate::from_ymd_opt(2026, 11, 24).expect("day1");
+        let day2 = NaiveDate::from_ymd_opt(2026, 11, 25).expect("day2");
+        let day1_run = day1.and_hms_opt(3, 30, 0).expect("03:30");
+        let day2_early_run = day2.and_hms_opt(6, 3, 0).expect("06:03");
+        let task_at = DailyTime::new(3, 30).expect("03:30");
+        let digest_at = DailyTime::new(8, 0).expect("08:00");
+
+        let mut scheduler =
+            crate::services::maintenance::MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "auditor_nightly",
+                TaskSchedule::DailyAt(task_at),
+            )]);
+        let now_mono = std::time::Instant::now();
+        scheduler.record(0, MaintenanceStatus::Success, day1_run, now_mono);
+        scheduler.record(0, MaintenanceStatus::Success, day2_early_run, now_mono);
+
+        // Persisting and restoring across restart must retain both runs for catch-up digest.
+        let exported = scheduler.export_state();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("guardian-digest-catchup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let state_path = dir.join("state.json");
+        state::save(&state_path, &exported).expect("save");
+        let loaded = state::load(&state_path).expect("load");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut restored =
+            crate::services::maintenance::MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "auditor_nightly",
+                TaskSchedule::DailyAt(task_at),
+            )]);
+        restored.restore(&loaded, day2_early_run, now_mono);
+
+        let catchup_summary = summarize_tasks(restored.tasks(), day1, digest_at);
+        assert_eq!(
+            catchup_summary,
+            vec![DigestTaskSummary {
+                name: "auditor_nightly".to_string(),
+                state: DigestTaskState::Succeeded {
+                    ran_at: "03:30".to_string(),
+                },
+            }],
+            "Day 2 early run at 06:03 must not erase Day 1 03:30 run from Day 1 catch-up digest"
+        );
+
+        let today_summary = summarize_tasks(restored.tasks(), day2, digest_at);
+        assert_eq!(
+            today_summary,
+            vec![DigestTaskSummary {
+                name: "auditor_nightly".to_string(),
+                state: DigestTaskState::Succeeded {
+                    ran_at: "06:03".to_string(),
+                },
+            }]
         );
     }
 }

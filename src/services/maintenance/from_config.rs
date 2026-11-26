@@ -26,6 +26,12 @@ pub fn scheduled_tasks(
     tasks: &[MaintenanceTaskConfig],
     postgres: &PostgresConfig,
 ) -> Result<Vec<ScheduledTask>, String> {
+    let mut seen = std::collections::HashSet::new();
+    for task in tasks {
+        if !seen.insert(task.name.as_str()) {
+            return Err(format!("duplicate maintenance task name {:?}", task.name));
+        }
+    }
     tasks.iter().map(|task| one_task(task, postgres)).collect()
 }
 
@@ -68,6 +74,20 @@ fn one_task(
     {
         return Err(format!(
             "task {}: database must be a non-empty path-safe identifier",
+            task.name
+        ));
+    }
+
+    if task.timeout_secs == 0 {
+        return Err(format!(
+            "task {}: timeout_secs must be greater than zero",
+            task.name
+        ));
+    }
+
+    if task.verify_timeout_secs == 0 {
+        return Err(format!(
+            "task {}: verify_timeout_secs must be greater than zero",
             task.name
         ));
     }
@@ -429,5 +449,41 @@ maintenance:
             .expect_err("a busy loop is not a schedule");
 
         assert!(error.contains("greater than zero"), "error was: {error}");
+    }
+
+    #[test]
+    fn zero_task_or_verify_timeout_is_rejected() {
+        let zero_dump = r#"
+maintenance:
+  enabled: true
+  tasks:
+    - name: nightly
+      kind: postgres_backup
+      instance: principal
+      daily_at: "03:30"
+      timeout_secs: 0
+"#;
+        let cfg_dump = loaded(zero_dump).expect("YAML parses");
+        let err_dump = scheduled_tasks(&cfg_dump.maintenance.tasks, &cfg_dump.postgres)
+            .expect_err("timeout_secs=0 must fail");
+        assert!(err_dump.contains("timeout_secs"), "error was: {err_dump}");
+
+        let zero_verify = r#"
+maintenance:
+  enabled: true
+  tasks:
+    - name: nightly
+      kind: postgres_backup
+      instance: principal
+      daily_at: "03:30"
+      verify_timeout_secs: 0
+"#;
+        let cfg_verify = loaded(zero_verify).expect("YAML parses");
+        let err_verify = scheduled_tasks(&cfg_verify.maintenance.tasks, &cfg_verify.postgres)
+            .expect_err("verify_timeout_secs=0 must fail");
+        assert!(
+            err_verify.contains("verify_timeout_secs"),
+            "error was: {err_verify}"
+        );
     }
 }

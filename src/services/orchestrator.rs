@@ -116,7 +116,8 @@ impl Orchestrator {
 
         // Before the first tick, which fires immediately: a task restored here must
         // not be seen as never having run.
-        self.restore_state(Local::now().naive_local(), Instant::now());
+        self.restore_state(Local::now().naive_local(), Instant::now())
+            .await;
 
         loop {
             tokio::select! {
@@ -127,18 +128,13 @@ impl Orchestrator {
                         info!(tick, "Collection cycle");
                     }
 
-                    // A collector that is timing out can hold this tick for longer
-                    // than systemd is willing to wait, so the tick itself races the
-                    // signal instead of only being checked between ticks.
+                    // Phase-aware shutdown inside `tick` lets slow collectors and
+                    // outbound HTTP yield immediately on SIGTERM without ever
+                    // interrupting `record` + `persist_state` after a backup finishes.
                     let mut tick_shutdown = shutdown.clone();
-                    let mut cancel = tick_shutdown.clone();
-
-                    tokio::select! {
-                        _ = self.tick(tick, &mut tick_shutdown) => {}
-                        _ = wait_for_shutdown(&mut cancel) => {
-                            info!("Shutdown signal received mid-cycle, stopping GuardianRS");
-                            return Ok(());
-                        }
+                    if self.tick(tick, &mut tick_shutdown).await {
+                        info!("Shutdown signal received mid-cycle, stopping GuardianRS");
+                        return Ok(());
                     }
                 }
                 _ = wait_for_shutdown(&mut shutdown) => {
@@ -151,18 +147,64 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Execute one full cycle across fault-isolated phases (`I2.3`, `I4.2`):
+    /// Execute one full cycle across fault-isolated phases (`I2.3`, `I4.2`).
     ///
-    /// 1. metric collection and alert evaluation;
-    /// 2. at most one due maintenance task;
-    /// 3. daily human liveness digest when due;
-    /// 4. outbound transport flush (always runs, even when collection failed,
-    ///    startup grace deferred evaluation, or no new events fired).
-    async fn tick(&mut self, tick: u64, shutdown: &mut watch::Receiver<bool>) {
-        self.collect_and_alert(tick).await;
+    /// Returns `true` if a shutdown signal was observed during the cycle:
+    ///
+    /// 1. outbound transport flush (always runs first, even when collection
+    ///    failed, startup grace deferred evaluation, or no new events fired);
+    /// 2. metric collection and alert evaluation;
+    /// 3. at most one due maintenance task;
+    /// 4. daily human liveness digest when due.
+    async fn tick(&mut self, tick: u64, shutdown: &mut watch::Receiver<bool>) -> bool {
+        if *shutdown.borrow() {
+            return true;
+        }
+
+        // Phase 1: Outbound transport flush.
+        {
+            let mut cancel = shutdown.clone();
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut cancel) => return true,
+                _ = self.flush_notifications() => {}
+            }
+        }
+        if *shutdown.borrow() {
+            return true;
+        }
+
+        // Phase 2: Metric collection and alert evaluation.
+        {
+            let mut cancel = shutdown.clone();
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut cancel) => return true,
+                _ = self.collect_and_alert(tick) => {}
+            }
+        }
+        if *shutdown.borrow() {
+            return true;
+        }
+
+        // Phase 3: At most one due maintenance task (`maintain` races `backup.run`
+        // internally and completes `record` + `persist_state` uninterrupted).
         self.maintain(shutdown, tick).await;
-        self.maybe_send_digest().await;
-        self.flush_notifications().await;
+        if *shutdown.borrow() {
+            return true;
+        }
+
+        // Phase 4: Daily human liveness digest.
+        {
+            let mut cancel = shutdown.clone();
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut cancel) => return true,
+                _ = self.maybe_send_digest() => {}
+            }
+        }
+
+        *shutdown.borrow()
     }
 
     async fn maybe_send_digest(&mut self) {
@@ -177,6 +219,18 @@ impl Orchestrator {
         }
 
         let now_local = Local::now();
+
+        // Wait until all overdue maintenance tasks have executed (one per tick)
+        // before emitting a catch-up digest so completed catch-up runs are not
+        // misreported as "pending / did not run" (`I4.2`).
+        if self
+            .maintenance
+            .pick_due(now_local.naive_local(), Instant::now())
+            .is_some()
+        {
+            return;
+        }
+
         let Some(trigger) = evaluate_digest_due(
             &Local,
             at,
@@ -203,7 +257,7 @@ impl Orchestrator {
             .map(|(name, count)| (name.clone(), *count))
             .collect();
 
-        let tasks = summarize_tasks(self.maintenance.tasks(), now_local.naive_local());
+        let tasks = summarize_tasks(self.maintenance.tasks(), trigger.target_date, at);
 
         let report = DigestReport {
             generated_at: Utc::now(),
@@ -228,7 +282,7 @@ impl Orchestrator {
 
         self.last_digest_date = Some(trigger.target_date);
         self.collector_failures.clear();
-        self.persist_state();
+        self.persist_state().await;
     }
 
     async fn flush_notifications(&mut self) {
@@ -249,6 +303,12 @@ impl Orchestrator {
     /// starting them all puts a `pg_dump` and everything else into one I/O window.
     /// The others are taken by later ticks.
     async fn maintain(&mut self, shutdown: &mut watch::Receiver<bool>, tick: u64) {
+        // Defer overdue post-reboot backups until startup grace finishes so
+        // PostgreSQL containers have finished starting before `pg_dump` runs.
+        if self.started.elapsed() < self.startup_grace {
+            return;
+        }
+
         let now_wall = Local::now().naive_local();
         let now_mono = Instant::now();
 
@@ -314,7 +374,7 @@ impl Orchestrator {
             .maintenance
             .record(index, outcome.status, now_wall, now_mono);
 
-        self.persist_state();
+        self.persist_state().await;
 
         info!(
             task = %outcome.task,
@@ -333,28 +393,40 @@ impl Orchestrator {
         }
 
         for notifier in &self.notifiers {
-            if let Err(error) = notifier.send_maintenance(&outcome).await {
-                error!(
-                    notifier = notifier.name(),
-                    error = %error,
-                    "Maintenance notification failed"
-                );
+            let mut cancel = shutdown.clone();
+            tokio::select! {
+                biased;
+                result = notifier.send_maintenance(&outcome) => {
+                    if let Err(error) = result {
+                        error!(
+                            notifier = notifier.name(),
+                            error = %error,
+                            "Maintenance notification failed"
+                        );
+                    }
+                }
+                _ = wait_for_shutdown(&mut cancel) => {
+                    return;
+                }
             }
         }
     }
 
-    /// Adopt the runs recorded by a previous process.
+    /// Adopt the runs recorded by a previous process without blocking the async worker.
     ///
     /// An unreadable record is a warning and not a failure: refusing to start would
     /// cost every metric to protect a scheduling hint, and the cost of carrying on
     /// is exactly one extra run.
-    fn restore_state(&mut self, now_wall: chrono::NaiveDateTime, now_mono: Instant) {
+    async fn restore_state(&mut self, now_wall: chrono::NaiveDateTime, now_mono: Instant) {
         let Some(path) = self.state_path.clone() else {
             return;
         };
 
-        match state::load(&path) {
-            Ok(recorded) => {
+        let path_for_load = path.clone();
+        let load_result = tokio::task::spawn_blocking(move || state::load(&path_for_load)).await;
+
+        match load_result {
+            Ok(Ok(recorded)) => {
                 self.maintenance.restore(&recorded, now_wall, now_mono);
                 self.last_digest_date = recorded.last_digest_date();
 
@@ -365,20 +437,25 @@ impl Orchestrator {
                     "Maintenance and digest state restored"
                 );
             }
-            Err(reason) => warn!(
+            Ok(Err(reason)) => warn!(
                 reason = %reason,
                 "Ignoring unreadable maintenance state; every task will run once"
+            ),
+            Err(error) => warn!(
+                %error,
+                path = %path.display(),
+                "Maintenance state restore task failed; every task will run once"
             ),
         }
     }
 
-    /// Remember what has run, so a restart does not repeat it.
+    /// Remember what has run without blocking the async worker.
     ///
     /// A failed write is a warning, never an error: the run already happened and
     /// the record is a convenience, while failing here would report a successful
     /// backup as a failed cycle.
-    fn persist_state(&self) {
-        let Some(path) = &self.state_path else {
+    async fn persist_state(&mut self) {
+        let Some(path) = self.state_path.clone() else {
             return;
         };
 
@@ -387,12 +464,22 @@ impl Orchestrator {
             .export_state()
             .with_last_digest_date(self.last_digest_date);
 
-        if let Err(reason) = state::save(path, &snapshot) {
-            warn!(
+        let path_for_save = path.clone();
+        let save_result =
+            tokio::task::spawn_blocking(move || state::save(&path_for_save, &snapshot)).await;
+
+        match save_result {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => warn!(
                 reason = %reason,
                 path = %path.display(),
                 "Could not record maintenance state"
-            );
+            ),
+            Err(error) => warn!(
+                %error,
+                path = %path.display(),
+                "Maintenance state persistence task failed"
+            ),
         }
     }
 
@@ -609,7 +696,9 @@ mod tests {
             digest_at: None,
         });
 
-        second.restore_state(Local::now().naive_local(), Instant::now());
+        second
+            .restore_state(Local::now().naive_local(), Instant::now())
+            .await;
         second.maintain(&mut rx, 1).await;
 
         assert!(
@@ -658,6 +747,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         outcomes: Arc<Mutex<Vec<MaintenanceOutcome>>>,
+        digests: Arc<Mutex<Vec<DigestReport>>>,
         alerts: Arc<Mutex<usize>>,
         flushes: Arc<Mutex<usize>>,
     }
@@ -678,6 +768,11 @@ mod tests {
             outcome: &MaintenanceOutcome,
         ) -> Result<(), NotifierError> {
             self.outcomes.lock().expect("lock").push(outcome.clone());
+            Ok(())
+        }
+
+        async fn send_digest(&self, digest: &DigestReport) -> Result<(), NotifierError> {
+            self.digests.lock().expect("lock").push(digest.clone());
             Ok(())
         }
 
@@ -888,33 +983,42 @@ mod tests {
     async fn flush_runs_even_when_collectors_fail_or_emit_no_events() {
         let recorder = Recorder::default();
         let flushes = Arc::clone(&recorder.flushes);
+        let alerts = Arc::clone(&recorder.alerts);
 
         let mut orchestrator = Orchestrator::new(OrchestratorDeps {
-            collectors: vec![Box::new(BrokenCollector)],
+            collectors: vec![Box::new(HotCpu)],
             alert_engine: Box::new(hot_cpu_engine()),
             notifiers: vec![Box::new(recorder)],
             poll_interval: Duration::from_secs(30),
             maintenance: MaintenanceScheduler::default(),
             executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
             state_path: None,
-            startup_grace: Duration::ZERO,
+            startup_grace: Duration::from_secs(3600),
             digest_at: None,
         });
 
         let (_tx, mut rx) = watch::channel(false);
-        // Tick 1: collector fails (`snapshots.is_empty()`), yet flush MUST run.
+        // Tick 1: startup_grace suppresses alert evaluation, yet flush MUST run.
         orchestrator.tick(1, &mut rx).await;
         assert_eq!(*flushes.lock().expect("lock"), 1);
+        assert_eq!(*alerts.lock().expect("lock"), 0);
 
-        // Replace with a steady-state collector: Tick 2 fires Critical, Tick 3 emits 0 events.
-        orchestrator.collectors = vec![Box::new(HotCpu)];
+        // Tick 2: end startup grace with BrokenCollector (`snapshots.is_empty()`), yet flush MUST run.
+        orchestrator.startup_grace = Duration::ZERO;
+        orchestrator.collectors = vec![Box::new(BrokenCollector)];
         orchestrator.tick(2, &mut rx).await;
+        assert_eq!(*flushes.lock().expect("lock"), 2);
+
+        // Replace with a steady-state collector: Tick 3 fires Critical, Tick 4 emits 0 events.
+        orchestrator.collectors = vec![Box::new(HotCpu)];
         orchestrator.tick(3, &mut rx).await;
+        orchestrator.tick(4, &mut rx).await;
         assert_eq!(
             *flushes.lock().expect("lock"),
-            3,
+            4,
             "flush must execute as its own phase on every tick"
         );
+        assert_eq!(*alerts.lock().expect("lock"), 1);
     }
 
     /// `DailyAt` is what production runs; the interval form had only ever been
@@ -974,6 +1078,32 @@ mod tests {
     /// exists, nothing records it, and the log says it was cancelled.
     #[tokio::test]
     async fn a_run_that_finishes_as_shutdown_arrives_is_still_recorded() {
+        struct SimultaneousFinishExecutor {
+            arrived: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+
+        #[async_trait]
+        impl Executor for SimultaneousFinishExecutor {
+            async fn run(
+                &self,
+                _request: &ExecutionRequest,
+            ) -> Result<ExecutionOutput, ExecutionError> {
+                let arrived = self.arrived.lock().expect("lock").take();
+                if let Some(tx) = arrived {
+                    let _ = tx.send(());
+                }
+                let release = self.release.lock().expect("lock").take();
+                if let Some(rx) = release {
+                    let _ = rx.await;
+                }
+                Err(ExecutionError::Spawn {
+                    program: "pg_dump".to_string(),
+                    reason: "missing".to_string(),
+                })
+            }
+        }
+
         // Without the ordered poll this pass rate would be 2^-20; with it, every run wins.
         for attempt in 0..20 {
             let dir = std::env::temp_dir().join(format!(
@@ -989,6 +1119,10 @@ mod tests {
             let recorder = Recorder::default();
             let seen = Arc::clone(&recorder.outcomes);
 
+            let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (shutdown_tx, mut rx) = watch::channel(false);
+
             let mut orchestrator = Orchestrator::new(OrchestratorDeps {
                 collectors: Vec::new(),
                 alert_engine: Box::new(AlertEngine::new(Vec::new())),
@@ -999,15 +1133,24 @@ mod tests {
                     TaskSchedule::Every(Duration::from_secs(3600)),
                 )
                 .with_backup(backup)]),
-                executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
+                executor: Box::new(SimultaneousFinishExecutor {
+                    arrived: Mutex::new(Some(arrived_tx)),
+                    release: Mutex::new(Some(release_rx)),
+                }),
                 state_path: None,
                 startup_grace: Duration::ZERO,
                 digest_at: None,
             });
 
-            // Requested already, so the signal branch is ready on the first poll,
-            // together with the run that completes immediately.
-            let (_tx, mut rx) = watch::channel(true);
+            // Once `BackupTask::run` reaches `executor.run`, release both the finished
+            // outcome and the shutdown signal in the same turn so both `select!`
+            // branches are `Poll::Ready` on the next poll.
+            tokio::spawn(async move {
+                let _ = arrived_rx.await;
+                let _ = release_tx.send(());
+                let _ = shutdown_tx.send(true);
+            });
+
             orchestrator.maintain(&mut rx, 1).await;
 
             assert!(
@@ -1017,5 +1160,80 @@ mod tests {
 
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[tokio::test]
+    async fn maintenance_waits_out_startup_grace() {
+        let recorder = Recorder::default();
+        let seen = Arc::clone(&recorder.outcomes);
+
+        let backup = BackupTask::new(BackupSettings::new("host", 5432, "user", "db", "secret"));
+
+        let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: Vec::new(),
+            alert_engine: Box::new(AlertEngine::new(Vec::new())),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::new(vec![ScheduledTask::new(
+                "auditor_nightly",
+                TaskSchedule::Every(Duration::ZERO),
+            )
+            .with_backup(backup)]),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(vec![failure()])))),
+            state_path: None,
+            startup_grace: Duration::from_secs(3600),
+            digest_at: None,
+        });
+
+        let (_tx, mut rx) = watch::channel(false);
+        orchestrator.maintain(&mut rx, 1).await;
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "maintenance must defer overdue tasks during startup_grace"
+        );
+
+        // Once startup_grace elapses, the overdue task executes immediately.
+        orchestrator.startup_grace = Duration::ZERO;
+        orchestrator.maintain(&mut rx, 2).await;
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn digest_waits_until_overdue_maintenance_tasks_finish() {
+        let recorder = Recorder::default();
+        let digests = Arc::clone(&recorder.digests);
+        let midnight = DailyTime::new(0, 0).expect("00:00");
+
+        let mut orchestrator = Orchestrator::new(OrchestratorDeps {
+            collectors: Vec::new(),
+            alert_engine: Box::new(AlertEngine::new(Vec::new())),
+            notifiers: vec![Box::new(recorder)],
+            poll_interval: Duration::from_secs(30),
+            maintenance: MaintenanceScheduler::new(vec![
+                ScheduledTask::new("first_nightly", TaskSchedule::DailyAt(midnight)),
+                ScheduledTask::new("second_nightly", TaskSchedule::DailyAt(midnight)),
+            ]),
+            executor: Box::new(Scripted(Arc::new(Mutex::new(Vec::new())))),
+            state_path: None,
+            startup_grace: Duration::ZERO,
+            digest_at: Some(midnight),
+        });
+
+        let (_tx, mut rx) = watch::channel(false);
+
+        // Tick 1 runs `first_nightly`, while `second_nightly` is still overdue -> digest waits!
+        orchestrator.tick(1, &mut rx).await;
+        assert!(
+            digests.lock().expect("lock").is_empty(),
+            "digest must wait while second_nightly is still overdue"
+        );
+
+        // Tick 2 runs `second_nightly`; with zero overdue tasks left, digest fires on Tick 2!
+        orchestrator.tick(2, &mut rx).await;
+        assert_eq!(
+            digests.lock().expect("lock").len(),
+            1,
+            "digest fires once all overdue maintenance tasks have completed"
+        );
     }
 }

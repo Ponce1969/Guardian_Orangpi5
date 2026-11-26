@@ -31,6 +31,9 @@ pub enum TaskSchedule {
     DailyAt(DailyTime),
 }
 
+/// Maximum number of recent runs retained in memory per task for digest lookback.
+const MAX_RECENT_RUNS: usize = 8;
+
 /// A scheduled task and what is known about its last run.
 #[derive(Debug, Clone)]
 pub struct ScheduledTask {
@@ -45,6 +48,7 @@ pub struct ScheduledTask {
     last_run_wall: Option<NaiveDateTime>,
     last_run_mono: Option<Instant>,
     last_status: Option<MaintenanceStatus>,
+    recent_runs: Vec<(NaiveDateTime, MaintenanceStatus)>,
 }
 
 impl ScheduledTask {
@@ -57,6 +61,7 @@ impl ScheduledTask {
             last_run_wall: None,
             last_run_mono: None,
             last_status: None,
+            recent_runs: Vec::new(),
         }
     }
 
@@ -75,6 +80,11 @@ impl ScheduledTask {
     /// Local wall-clock timestamp of the most recent recorded run, if any.
     pub fn last_run_wall(&self) -> Option<NaiveDateTime> {
         self.last_run_wall
+    }
+
+    /// Recent `(wall_clock, status)` runs recorded for this task, oldest to newest.
+    pub fn recent_runs(&self) -> &[(NaiveDateTime, MaintenanceStatus)] {
+        &self.recent_runs
     }
 
     /// Whether this task is due, and why.
@@ -161,6 +171,11 @@ impl MaintenanceScheduler {
         task.last_run_wall = Some(now_wall);
         task.last_run_mono = Some(now_mono);
         task.last_status = Some(status);
+        task.recent_runs.push((now_wall, status));
+        if task.recent_runs.len() > MAX_RECENT_RUNS {
+            let excess = task.recent_runs.len() - MAX_RECENT_RUNS;
+            task.recent_runs.drain(..excess);
+        }
 
         notify
     }
@@ -185,7 +200,24 @@ impl MaintenanceScheduler {
             })
             .collect();
 
-        MaintenanceState::new(tasks)
+        let previous_tasks = self
+            .tasks
+            .iter()
+            .filter(|task| task.last_status == Some(MaintenanceStatus::Success))
+            .filter_map(|task| {
+                task.recent_runs
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .find(|(_, status)| *status == MaintenanceStatus::Success)
+                    .map(|(last_run, _)| TaskState {
+                        name: task.name.clone(),
+                        last_run: *last_run,
+                    })
+            })
+            .collect();
+
+        MaintenanceState::new(tasks).with_previous_tasks(previous_tasks)
     }
 
     /// Adopt the runs recorded by a previous process.
@@ -207,10 +239,19 @@ impl MaintenanceScheduler {
                 continue;
             };
 
-            task.last_run_wall = state.last_run(&task.name);
+            let last_run = state.last_run(&task.name);
+            task.last_run_wall = last_run;
             // `export_state` persists only proven `Success` runs, so restoring a
             // recorded timestamp also restores its `Success` status for the digest.
             task.last_status = Some(MaintenanceStatus::Success);
+
+            task.recent_runs.clear();
+            if let Some(prev) = state.previous_run(&task.name) {
+                task.recent_runs.push((prev, MaintenanceStatus::Success));
+            }
+            if let Some(last) = last_run {
+                task.recent_runs.push((last, MaintenanceStatus::Success));
+            }
 
             // `checked_sub` fails when the elapsed time reaches further back than
             // the platform can represent from now, which happens when the run
