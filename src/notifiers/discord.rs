@@ -1,9 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::alerts::state::AlertSeverity;
@@ -14,22 +14,28 @@ use crate::notifiers::outbox::{
 };
 use crate::notifiers::{Notifier, NotifierError};
 use crate::services::digest::DigestReport;
-use crate::services::maintenance::{tail_chars, MaintenanceOutcome, MaintenanceStatus};
+use crate::services::maintenance::{MaintenanceOutcome, MaintenanceStatus};
 
 /// Default TCP/TLS handshake deadline for Discord webhook calls (`I2.1`).
-pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default total HTTP request/response deadline for Discord webhook calls (`I2.1`).
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum error body characters retained for logging (`I3.1`).
 pub const DEFAULT_MAX_ERROR_BODY_CHARS: usize = 512;
 
 /// Maximum `Retry-After` delay honored inline before spooling to the outbox.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(2);
 
 /// Maximum raw bytes read from a failing HTTP response stream.
 const MAX_ERROR_BODY_BYTES: usize = 4096;
+
+/// Maximum outbox entries flushed in a single tick so draining stays bounded.
+const MAX_FLUSH_BATCH_PER_TICK: usize = 8;
+
+/// Maximum wall time spent draining the outbox in a single tick.
+const MAX_FLUSH_DURATION: Duration = Duration::from_secs(15);
 
 /// Discord embed color codes mapped to severity.
 mod color {
@@ -110,8 +116,9 @@ impl MetricKind {
 pub struct DiscordNotifier {
     webhook_url: String,
     hostname: String,
-    client: reqwest::Client,
+    client: Result<reqwest::Client, String>,
     retry_delays: Vec<Duration>,
+    outbox_capacity: usize,
     outbox_path: Option<PathBuf>,
     outbox: Mutex<DeliveryOutbox>,
 }
@@ -121,6 +128,7 @@ impl std::fmt::Debug for DiscordNotifier {
         f.debug_struct("DiscordNotifier")
             .field("webhook_url", &"***")
             .field("hostname", &self.hostname)
+            .field("outbox_capacity", &self.outbox_capacity)
             .field("outbox_path", &self.outbox_path)
             .finish()
     }
@@ -145,7 +153,8 @@ impl DiscordNotifier {
             webhook_url,
             hostname,
             client,
-            retry_delays: vec![Duration::from_secs(1), Duration::from_secs(2)],
+            retry_delays: vec![Duration::from_millis(500), Duration::from_millis(1000)],
+            outbox_capacity: DEFAULT_OUTBOX_CAPACITY,
             outbox_path: None,
             outbox: Mutex::new(DeliveryOutbox::with_capacity(DEFAULT_OUTBOX_CAPACITY)),
         }
@@ -163,21 +172,17 @@ impl DiscordNotifier {
         self
     }
 
-    /// Override durable outbox capacity.
-    pub fn with_outbox_capacity(self, capacity: usize) -> Self {
-        if let Ok(mut guard) = self.outbox.lock() {
-            guard.set_capacity(capacity);
-        }
+    /// Override durable outbox capacity regardless of builder call order.
+    pub fn with_outbox_capacity(mut self, capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        self.outbox_capacity = cap;
+        self.outbox.get_mut().set_capacity(cap);
         self
     }
 
     /// Attach a durable disk outbox and restore any previously queued messages.
     pub fn with_outbox_path(mut self, path: PathBuf) -> Self {
-        let capacity = self
-            .outbox
-            .lock()
-            .map(|guard| guard.entries().len().max(DEFAULT_OUTBOX_CAPACITY))
-            .unwrap_or(DEFAULT_OUTBOX_CAPACITY);
+        let capacity = self.outbox_capacity;
 
         match outbox::load(&path, capacity) {
             Ok(loaded) => {
@@ -188,9 +193,7 @@ impl DiscordNotifier {
                         "Restored pending Discord notifications from outbox"
                     );
                 }
-                if let Ok(mut guard) = self.outbox.lock() {
-                    *guard = loaded;
-                }
+                *self.outbox.get_mut() = loaded;
             }
             Err(reason) => {
                 warn!(
@@ -198,18 +201,20 @@ impl DiscordNotifier {
                     path = %path.display(),
                     "Ignoring unreadable Discord outbox; starting with empty queue"
                 );
+                *self.outbox.get_mut() = DeliveryOutbox::with_capacity(capacity);
             }
         }
         self.outbox_path = Some(path);
         self
     }
 
-    fn build_client(connect: Duration, request: Duration) -> reqwest::Client {
+    fn build_client(connect: Duration, request: Duration) -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
             .connect_timeout(connect)
             .timeout(request)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .map_err(|e| format!("failed to initialize HTTP client: {e}"))
     }
 
     /// Build the Discord webhook payload as a JSON value.
@@ -337,9 +342,47 @@ impl DiscordNotifier {
         })
     }
 
+    /// Scrub the webhook URL, `/api/webhooks/<id>/<token>` path, and raw `<token>`
+    /// segment if echoed by a remote server or reverse proxy (`I3.1`).
+    fn scrub_webhook_secrets(&self, raw: &str) -> String {
+        if self.webhook_url.is_empty() {
+            return raw.to_string();
+        }
+
+        let mut scrubbed = raw.replace(&self.webhook_url, "***");
+
+        let after_scheme = self
+            .webhook_url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(self.webhook_url.as_str());
+
+        if let Some(slash_idx) = after_scheme.find('/') {
+            let path_and_query = &after_scheme[slash_idx..];
+            if path_and_query.len() > 1 {
+                scrubbed = scrubbed.replace(path_and_query, "***");
+            }
+            let path = path_and_query.split(['?', '#']).next().unwrap_or("");
+            if path.len() > 1 {
+                scrubbed = scrubbed.replace(path, "***");
+            }
+            if let Some(segments) = path.strip_prefix("/api/webhooks/") {
+                let mut parts = segments.split('/');
+                let _id = parts.next();
+                if let Some(token) = parts.next() {
+                    if !token.is_empty() {
+                        scrubbed = scrubbed.replace(token, "***");
+                    }
+                }
+            }
+        }
+
+        scrubbed
+    }
+
     /// Read at most `MAX_ERROR_BODY_BYTES` from a failed HTTP response and cap
     /// the formatted text to `DEFAULT_MAX_ERROR_BODY_CHARS`, scrubbing the
-    /// webhook URL if echoed (`I3.1`).
+    /// webhook URL, path, and token if echoed (`I3.1`).
     async fn read_bounded_error_body(&self, mut response: reqwest::Response) -> String {
         let mut buffer: Vec<u8> = Vec::new();
         loop {
@@ -362,17 +405,12 @@ impl DiscordNotifier {
         }
 
         let raw = String::from_utf8_lossy(&buffer);
-        let scrubbed = if self.webhook_url.is_empty() {
-            raw.to_string()
-        } else {
-            raw.replace(&self.webhook_url, "***")
-        };
+        let scrubbed = self.scrub_webhook_secrets(&raw);
         let folded = scrubbed.split_whitespace().collect::<Vec<_>>().join(" ");
         if folded.chars().count() <= DEFAULT_MAX_ERROR_BODY_CHARS {
             folded
         } else {
-            let kept = tail_chars(&folded, DEFAULT_MAX_ERROR_BODY_CHARS);
-            kept.to_string()
+            folded.chars().take(DEFAULT_MAX_ERROR_BODY_CHARS).collect()
         }
     }
 
@@ -382,13 +420,18 @@ impl DiscordNotifier {
         if !secs.is_finite() || secs <= 0.0 {
             return None;
         }
-        Some(Duration::from_secs_f64(secs).min(MAX_RETRY_AFTER))
+        let capped = secs.min(MAX_RETRY_AFTER.as_secs_f64());
+        Duration::try_from_secs_f64(capped).ok()
     }
 
     /// Execute a single HTTP POST attempt, stripping secret URLs from errors (`I3.1`).
     async fn dispatch_once(&self, payload: &serde_json::Value) -> Result<(), DispatchFailure> {
-        let response = self
-            .client
+        let client = self.client.as_ref().map_err(|reason| {
+            DispatchFailure::Permanent(NotifierError::SendFailed {
+                reason: reason.clone(),
+            })
+        })?;
+        let response = client
             .post(&self.webhook_url)
             .json(payload)
             .send()
@@ -446,17 +489,9 @@ impl DiscordNotifier {
         }
     }
 
-    async fn persist_outbox(&self) {
+    async fn persist_outbox_snapshot(&self, snapshot: DeliveryOutbox) {
         let Some(path) = self.outbox_path.clone() else {
             return;
-        };
-
-        let snapshot = match self.outbox.lock() {
-            Ok(guard) => guard.clone(),
-            Err(error) => {
-                warn!(%error, "Discord outbox lock poisoned during snapshot");
-                return;
-            }
         };
 
         let write_result =
@@ -476,67 +511,46 @@ impl DiscordNotifier {
         priority: OutboxPriority,
         payload: serde_json::Value,
     ) -> Result<(), NotifierError> {
-        let (already_queued, has_backlog) = self
-            .outbox
-            .lock()
-            .map(|guard| (guard.contains_key(&key), !guard.is_empty()))
-            .unwrap_or((false, false));
+        let mut guard = self.outbox.lock().await;
 
-        if already_queued {
-            // Supersede first so we never send a stale transition ahead of the
-            // newer state that just arrived for the same key.
-            let dropped_before = self
-                .outbox
-                .lock()
-                .map(|guard| guard.dropped_count)
-                .unwrap_or(0);
-            if let Ok(mut guard) = self.outbox.lock() {
+        if !guard.is_empty() {
+            let before = guard.dropped_count;
+            guard.upsert(key, priority, payload, Utc::now());
+            if guard.dropped_count > before {
+                error!(
+                    dropped_total = guard.dropped_count,
+                    "Discord outbox capacity exceeded; oldest entry evicted"
+                );
+            }
+            self.persist_outbox_snapshot(guard.clone()).await;
+            return Err(NotifierError::SendFailed {
+                reason: "Discord outbox has pending backlog; notification spooled for tick flush"
+                    .to_string(),
+            });
+        }
+
+        let pending_dropped = guard.dropped_count;
+        let wire_payload = outbox::decorate_payload_counts(&payload, 0, pending_dropped);
+
+        match self.dispatch_with_retries(&wire_payload).await {
+            Ok(()) => {
+                if pending_dropped > 0 {
+                    guard.dropped_count = 0;
+                    self.persist_outbox_snapshot(guard.clone()).await;
+                }
+                Ok(())
+            }
+            Err(DispatchFailure::Permanent(error)) => Err(error),
+            Err(DispatchFailure::Retryable { error, .. }) => {
+                let before = guard.dropped_count;
                 guard.upsert(key, priority, payload, Utc::now());
-                if guard.dropped_count > dropped_before {
+                if guard.dropped_count > before {
                     error!(
                         dropped_total = guard.dropped_count,
                         "Discord outbox capacity exceeded; oldest entry evicted"
                     );
                 }
-            }
-            self.persist_outbox().await;
-            return self.flush().await;
-        }
-
-        // Drain any older queued notifications first so FIFO order is preserved
-        // when connectivity returns mid-cycle.
-        if has_backlog {
-            if let Err(flush_err) = self.flush().await {
-                if let Ok(mut guard) = self.outbox.lock() {
-                    let before = guard.dropped_count;
-                    guard.upsert(key, priority, payload, Utc::now());
-                    if guard.dropped_count > before {
-                        error!(
-                            dropped_total = guard.dropped_count,
-                            "Discord outbox capacity exceeded; oldest entry evicted"
-                        );
-                    }
-                }
-                self.persist_outbox().await;
-                return Err(flush_err);
-            }
-        }
-
-        match self.dispatch_with_retries(&payload).await {
-            Ok(()) => Ok(()),
-            Err(DispatchFailure::Permanent(error)) => Err(error),
-            Err(DispatchFailure::Retryable { error, .. }) => {
-                if let Ok(mut guard) = self.outbox.lock() {
-                    let before = guard.dropped_count;
-                    guard.upsert(key, priority, payload, Utc::now());
-                    if guard.dropped_count > before {
-                        error!(
-                            dropped_total = guard.dropped_count,
-                            "Discord outbox capacity exceeded; oldest entry evicted"
-                        );
-                    }
-                }
-                self.persist_outbox().await;
+                self.persist_outbox_snapshot(guard.clone()).await;
                 Err(error)
             }
         }
@@ -617,10 +631,7 @@ impl Notifier for DiscordNotifier {
 
     async fn send(&self, event: &AlertEvent) -> Result<(), NotifierError> {
         let payload = Self::build_payload(event, &self.hostname);
-        let key = OutboxKey::Alert {
-            metric: event.metric,
-            labels: event.labels.clone(),
-        };
+        let key = OutboxKey::from_alert_event(event);
         let priority = if event.severity == AlertSeverity::Recovered {
             OutboxPriority::Recovery
         } else {
@@ -664,52 +675,39 @@ impl Notifier for DiscordNotifier {
     }
 
     async fn flush(&self) -> Result<(), NotifierError> {
-        let mut changed = false;
+        let mut guard = self.outbox.lock().await;
+        let started = std::time::Instant::now();
+        let mut processed: usize = 0;
         let mut last_error: Option<NotifierError> = None;
 
-        loop {
-            let next = match self.outbox.lock() {
-                Ok(guard) => guard
-                    .peek_front()
-                    .map(|(entry, dropped)| decorate_payload(entry, dropped)),
-                Err(error) => {
-                    return Err(NotifierError::Unhealthy {
-                        name: "discord".to_string(),
-                        reason: format!("outbox lock poisoned: {error}"),
-                    });
-                }
-            };
-
-            let Some(payload) = next else {
+        while processed < MAX_FLUSH_BATCH_PER_TICK && started.elapsed() < MAX_FLUSH_DURATION {
+            let Some(payload) = guard
+                .peek_front()
+                .map(|(entry, dropped)| decorate_payload(entry, dropped))
+            else {
                 break;
             };
 
             match self.dispatch_with_retries(&payload).await {
                 Ok(()) => {
-                    if let Ok(mut guard) = self.outbox.lock() {
-                        guard.pop_front_delivered();
-                    }
-                    changed = true;
+                    guard.pop_front_delivered();
+                    self.persist_outbox_snapshot(guard.clone()).await;
+                    processed += 1;
                 }
                 Err(DispatchFailure::Permanent(error)) => {
                     // Drop unrecoverable 4xx payloads rather than blocking the
-                    // entire queue forever, logging loudly.
+                    // entire queue forever, logging loudly while preserving dropped_count.
                     error!(%error, "Dropping permanently rejected Discord outbox entry");
-                    if let Ok(mut guard) = self.outbox.lock() {
-                        guard.pop_front_delivered();
-                    }
-                    changed = true;
+                    guard.pop_front_discarded();
+                    self.persist_outbox_snapshot(guard.clone()).await;
                     last_error = Some(error);
+                    processed += 1;
                 }
                 Err(DispatchFailure::Retryable { error, .. }) => {
                     last_error = Some(error);
                     break;
                 }
             }
-        }
-
-        if changed {
-            self.persist_outbox().await;
         }
 
         match last_error {
@@ -1051,20 +1049,67 @@ mod tests {
         );
     }
 
+    async fn read_http_body(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 2048];
+        let mut header_end: Option<usize> = None;
+        let mut content_length: usize = 0;
+
+        loop {
+            let n = match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+
+            if header_end.is_none() {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                    for line in headers.lines() {
+                        if let Some((name, val)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = val.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(end) = header_end {
+                if buf.len() >= end + content_length {
+                    return String::from_utf8_lossy(&buf[end..end + content_length]).to_string();
+                }
+            }
+        }
+
+        if let Some(end) = header_end {
+            String::from_utf8_lossy(&buf[end..]).to_string()
+        } else {
+            String::new()
+        }
+    }
+
     #[tokio::test]
     async fn webhook_error_body_is_bounded() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let secret_token = "SECRET_BODY_ECHO_TOKEN_42";
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut req_buf = [0u8; 2048];
-            let _ = socket.read(&mut req_buf).await;
-            let huge_body = "X".repeat(3000);
+            let _ = read_http_body(&mut socket).await;
+            let huge_body = format!(
+                "/api/webhooks/1/{secret_token} raw={secret_token} {}",
+                "X".repeat(5000)
+            );
             let response = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 huge_body.len(),
@@ -1074,7 +1119,7 @@ mod tests {
         });
 
         let notifier = DiscordNotifier::new(
-            format!("http://{addr}/api/webhooks/1/token"),
+            format!("http://{addr}/api/webhooks/1/{secret_token}"),
             TEST_HOST.to_string(),
         )
         .with_retry_delays(Vec::new());
@@ -1088,10 +1133,19 @@ mod tests {
         match err {
             NotifierError::WebhookFailed { status, body } => {
                 assert_eq!(status, 400);
-                assert!(
-                    body.chars().count() <= DEFAULT_MAX_ERROR_BODY_CHARS,
-                    "error body exceeded cap: len={}",
+                assert_eq!(
+                    body.chars().count(),
+                    DEFAULT_MAX_ERROR_BODY_CHARS,
+                    "error body must truncate at head cap: len={}",
                     body.chars().count()
+                );
+                assert!(
+                    body.starts_with("*** raw=***"),
+                    "head truncation must keep scrubbed prefix: {body}"
+                );
+                assert!(
+                    !body.contains(secret_token) && !body.contains("/api/webhooks/1"),
+                    "error body leaked webhook path or token: {body}"
                 );
             }
             other => panic!("expected WebhookFailed, got {other:?}"),
@@ -1101,29 +1155,28 @@ mod tests {
     #[tokio::test]
     async fn outbox_supersedes_by_key_and_records_skipped_transitions() {
         use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
         };
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let online = Arc::new(AtomicBool::new(false));
-        let received_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let received_bodies: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
 
         let online_srv = Arc::clone(&online);
+        let attempts_srv = Arc::clone(&attempts);
         let bodies_srv = Arc::clone(&received_bodies);
         let server = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                attempts_srv.fetch_add(1, Ordering::SeqCst);
+                let body = read_http_body(&mut socket).await;
                 if online_srv.load(Ordering::SeqCst) {
-                    if let Some((_, body)) = text.split_once("\r\n\r\n") {
-                        bodies_srv.lock().expect("lock").push(body.to_string());
-                    }
+                    bodies_srv.lock().expect("lock").push(body);
                     let _ = socket
                         .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
@@ -1141,19 +1194,29 @@ mod tests {
         )
         .with_retry_delays(Vec::new());
 
-        // Offline: Warning -> Critical -> Recovered on the same metric key.
-        assert!(notifier
-            .send(&make_event(AlertSeverity::Warning, 72.0, 70.0))
-            .await
-            .is_err());
-        assert!(notifier
-            .send(&make_event(AlertSeverity::Critical, 85.0, 80.0))
-            .await
-            .is_err());
-        assert!(notifier
-            .send(&make_event(AlertSeverity::Recovered, 60.0, 70.0))
-            .await
-            .is_err());
+        // Offline: Warning -> Critical -> Recovered on the same metric key,
+        // even with fluctuating volatile telemetry labels (`available_kb`).
+        let mut warn_ev = make_event(AlertSeverity::Warning, 72.0, 70.0);
+        warn_ev.labels = vec![("available_kb".to_string(), "900".to_string())];
+        assert!(notifier.send(&warn_ev).await.is_err());
+
+        let mut crit_ev = make_event(AlertSeverity::Critical, 85.0, 80.0);
+        crit_ev.labels = vec![("available_kb".to_string(), "400".to_string())];
+        let backlog_err = notifier.send(&crit_ev).await.expect_err("spools");
+        assert!(
+            backlog_err.to_string().contains("pending backlog"),
+            "subsequent alerts during backlog must spool immediately without HTTP retry: {backlog_err}"
+        );
+
+        let mut rec_ev = make_event(AlertSeverity::Recovered, 60.0, 70.0);
+        rec_ev.labels = vec![("available_kb".to_string(), "1500".to_string())];
+        assert!(notifier.send(&rec_ev).await.is_err());
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "backlog fast-spooling must perform zero network retries once outbox is non-empty"
+        );
 
         // Restore connectivity and flush.
         online.store(true, Ordering::SeqCst);
@@ -1176,7 +1239,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_persists_across_restart_and_enforces_capacity() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::AsyncWriteExt;
 
         let mut dir = std::env::temp_dir();
         dir.push(format!("guardian-outbox-test-{}", std::process::id()));
@@ -1198,6 +1262,7 @@ mod tests {
         .with_retry_delays(Vec::new())
         .with_outbox_path(path.clone())
         .with_outbox_capacity(2);
+        assert_eq!(first.outbox.lock().await.capacity(), 2);
 
         // Queue 1 Recovery + 2 Active entries into a capacity-2 outbox -> Recovery is evicted!
         let mut rec_event = make_event(AlertSeverity::Recovered, 55.0, 70.0);
@@ -1215,23 +1280,20 @@ mod tests {
 
         assert!(path.exists(), "outbox must be written to disk");
 
-        // Second process comes up against a healthy webhook endpoint and flushes.
+        // Second process comes up against a healthy webhook endpoint and flushes
+        // (using the opposite builder order `.with_outbox_capacity(2).with_outbox_path(...)`).
         let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let live_addr = live_listener.local_addr().expect("addr");
-        let delivered_payloads: std::sync::Arc<Mutex<Vec<String>>> =
-            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let delivered_payloads: std::sync::Arc<StdMutex<Vec<String>>> =
+            std::sync::Arc::new(StdMutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&delivered_payloads);
 
         let server = tokio::spawn(async move {
             while let Ok((mut socket, _)) = live_listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                if let Some((_, body)) = text.split_once("\r\n\r\n") {
-                    sink.lock().expect("lock").push(body.to_string());
-                }
+                let body = read_http_body(&mut socket).await;
+                sink.lock().expect("lock").push(body);
                 let _ = socket
                     .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     .await;
@@ -1245,6 +1307,11 @@ mod tests {
         .with_retry_delays(Vec::new())
         .with_outbox_capacity(2)
         .with_outbox_path(path.clone());
+        assert_eq!(
+            restarted.outbox.lock().await.capacity(),
+            2,
+            "with_outbox_capacity before with_outbox_path must also preserve capacity=2"
+        );
 
         restarted.flush().await.expect("restored outbox flushes");
         server.abort();
@@ -1260,5 +1327,300 @@ mod tests {
         assert!(sent[1].contains("Disk Usage"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn flush_discard_on_4xx_preserves_dropped_count_for_next_delivery() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_addr = closed.local_addr().expect("addr");
+        drop(closed);
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("guardian-outbox-4xx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("outbox.json");
+        let _ = std::fs::remove_file(&path);
+
+        // Overflow a capacity-2 outbox offline so dropped_count == 1 and 2 entries remain.
+        let offline = DiscordNotifier::new(
+            format!("http://{closed_addr}/api/webhooks/1/token"),
+            TEST_HOST.to_string(),
+        )
+        .with_retry_delays(Vec::new())
+        .with_outbox_capacity(2)
+        .with_outbox_path(path.clone());
+
+        let mut rec = make_event(AlertSeverity::Recovered, 50.0, 70.0);
+        rec.metric = MetricKind::CpuUsage;
+        let _ = offline.send(&rec).await;
+
+        let mut first_active = make_event(AlertSeverity::Critical, 96.0, 95.0);
+        first_active.metric = MetricKind::MemoryUsage;
+        let _ = offline.send(&first_active).await;
+
+        let mut second_active = make_event(AlertSeverity::Critical, 92.0, 90.0);
+        second_active.metric = MetricKind::DiskUsage;
+        let _ = offline.send(&second_active).await;
+        drop(offline);
+
+        // Live server rejects call #1 with permanent 400 and accepts call #2 with 204.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let delivered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let calls_srv = Arc::clone(&calls);
+        let delivered_srv = Arc::clone(&delivered);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let idx = calls_srv.fetch_add(1, Ordering::SeqCst);
+                let body = read_http_body(&mut socket).await;
+                if idx == 0 {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+                        .await;
+                } else {
+                    delivered_srv.lock().expect("lock").push(body);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        let online = DiscordNotifier::new(
+            format!("http://{addr}/api/webhooks/1/token"),
+            TEST_HOST.to_string(),
+        )
+        .with_retry_delays(Vec::new())
+        .with_outbox_capacity(2)
+        .with_outbox_path(path);
+
+        let flush_res = online.flush().await;
+        assert!(flush_res.is_err(), "400 is surfaced as last_error");
+        server.abort();
+
+        let ok_bodies = delivered.lock().expect("lock");
+        assert_eq!(ok_bodies.len(), 1);
+        assert!(
+            ok_bodies[0].contains("1 queued notification(s) dropped due to outbox capacity"),
+            "dropped_count must survive a discarded 400 entry and reach the next 204 delivery: {}",
+            ok_bodies[0]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn empty_outbox_surfaces_and_clears_dropped_count_after_4xx_discard() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_addr = closed.local_addr().expect("addr");
+        drop(closed);
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("guardian-empty-dropped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("outbox.json");
+        let _ = std::fs::remove_file(&path);
+
+        // Overflow a capacity-1 outbox offline so dropped_count == 1 and 1 entry remains.
+        let offline = DiscordNotifier::new(
+            format!("http://{closed_addr}/api/webhooks/1/token"),
+            TEST_HOST.to_string(),
+        )
+        .with_retry_delays(Vec::new())
+        .with_outbox_capacity(1)
+        .with_outbox_path(path.clone());
+
+        let mut evicted_ev = make_event(AlertSeverity::Recovered, 50.0, 70.0);
+        evicted_ev.metric = MetricKind::CpuUsage;
+        let _ = offline.send(&evicted_ev).await;
+
+        let mut bad_ev = make_event(AlertSeverity::Critical, 96.0, 95.0);
+        bad_ev.metric = MetricKind::MemoryUsage;
+        let _ = offline.send(&bad_ev).await;
+        drop(offline);
+
+        // Live server rejects call #0 (flushed 400 entry) and accepts call #1 (fast-path send).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let delivered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let calls_srv = Arc::clone(&calls);
+        let delivered_srv = Arc::clone(&delivered);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let idx = calls_srv.fetch_add(1, Ordering::SeqCst);
+                let body = read_http_body(&mut socket).await;
+                if idx == 0 {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+                        .await;
+                } else {
+                    delivered_srv.lock().expect("lock").push(body);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        let online = DiscordNotifier::new(
+            format!("http://{addr}/api/webhooks/1/token"),
+            TEST_HOST.to_string(),
+        )
+        .with_retry_delays(Vec::new())
+        .with_outbox_capacity(1)
+        .with_outbox_path(path.clone());
+
+        // Flush discards the 400 entry, leaving outbox empty with dropped_count == 1.
+        assert!(online.flush().await.is_err());
+        assert!(online.outbox.lock().await.is_empty());
+        assert_eq!(online.outbox.lock().await.dropped_count, 1);
+
+        // Fast-path send on empty outbox surfaces dropped_count and clears it on 204.
+        let mut fresh_ev = make_event(AlertSeverity::Critical, 92.0, 90.0);
+        fresh_ev.metric = MetricKind::DiskUsage;
+        online
+            .send(&fresh_ev)
+            .await
+            .expect("fast-path send succeeds");
+        server.abort();
+
+        assert_eq!(online.outbox.lock().await.dropped_count, 0);
+        assert_eq!(
+            outbox::load(&path, 1).expect("reload").dropped_count,
+            0,
+            "cleared dropped_count must persist to disk"
+        );
+
+        let ok_bodies = delivered.lock().expect("lock");
+        assert_eq!(ok_bodies.len(), 1);
+        assert!(
+            ok_bodies[0].contains("1 queued notification(s) dropped due to outbox capacity"),
+            "empty-outbox fast path must surface pending dropped_count: {}",
+            ok_bodies[0]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn flush_caps_per_tick_batch_and_persists_incrementally() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::io::AsyncWriteExt;
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_addr = closed.local_addr().expect("addr");
+        drop(closed);
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("guardian-flush-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("outbox.json");
+        let _ = std::fs::remove_file(&path);
+
+        let offline = DiscordNotifier::new(
+            format!("http://{closed_addr}/api/webhooks/1/token"),
+            TEST_HOST.to_string(),
+        )
+        .with_retry_delays(Vec::new())
+        .with_outbox_capacity(16)
+        .with_outbox_path(path.clone());
+
+        for i in 0..10 {
+            let outcome = MaintenanceOutcome {
+                task: format!("task_{i:02}"),
+                status: MaintenanceStatus::Failed,
+                exit_code: Some(1),
+                duration: Duration::from_secs(1),
+                detail: format!("failure {i}"),
+            };
+            let _ = offline.send_maintenance(&outcome).await;
+        }
+        drop(offline);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let delivered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let delivered_srv = Arc::clone(&delivered);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = read_http_body(&mut socket).await;
+                delivered_srv.lock().expect("lock").push(body);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let online = DiscordNotifier::new(
+            format!("http://{addr}/api/webhooks/1/token"),
+            TEST_HOST.to_string(),
+        )
+        .with_retry_delays(Vec::new())
+        .with_outbox_capacity(16)
+        .with_outbox_path(path.clone());
+
+        // First flush delivers MAX_FLUSH_BATCH_PER_TICK (8), leaving 2 persisted on disk.
+        online.flush().await.expect("first flush batch succeeds");
+        assert_eq!(delivered.lock().expect("lock").len(), 8);
+        assert_eq!(
+            outbox::load(&path, 16)
+                .expect("load after first flush")
+                .len(),
+            2
+        );
+
+        // Second flush drains the remaining 2 entries.
+        online.flush().await.expect("second flush batch succeeds");
+        server.abort();
+
+        assert_eq!(delivered.lock().expect("lock").len(), 10);
+        assert!(outbox::load(&path, 16)
+            .expect("load after second flush")
+            .is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_huge_values_without_panicking() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("1e30"),
+        );
+
+        assert_eq!(
+            DiscordNotifier::parse_retry_after(&headers),
+            Some(MAX_RETRY_AFTER)
+        );
     }
 }

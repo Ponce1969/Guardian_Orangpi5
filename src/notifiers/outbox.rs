@@ -12,6 +12,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::alerts::state::IDENTITY_LABELS;
+use crate::alerts::AlertEvent;
 use crate::metrics::MetricKind;
 
 const FORMAT_VERSION: u32 = 1;
@@ -31,6 +33,28 @@ pub enum OutboxKey {
         task: String,
     },
     Digest,
+}
+
+impl OutboxKey {
+    /// Build an alert outbox key keeping only static identity labels (`I1.1`, `I2.2`).
+    ///
+    /// `AlertEvent.labels` retains volatile telemetry (`available_kb`, `images_gb`,
+    /// etc.) for display and logging; stripping non-identity labels here ensures
+    /// supersession matches `AlertKey` even when telemetry fluctuates across ticks.
+    pub fn from_alert_event(event: &AlertEvent) -> Self {
+        let mut labels: Vec<(String, String)> = event
+            .labels
+            .iter()
+            .filter(|(name, _)| IDENTITY_LABELS.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        labels.sort();
+
+        Self::Alert {
+            metric: event.metric,
+            labels,
+        }
+    }
 }
 
 /// Eviction priority when the outbox reaches its capacity bound.
@@ -100,6 +124,10 @@ impl DeliveryOutbox {
         }
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -167,6 +195,15 @@ impl DeliveryOutbox {
         }
     }
 
+    /// Discard a permanently rejected (`4xx`) front entry without clearing
+    /// `dropped_count`, so accumulated overflow notices still surface on the
+    /// next successfully delivered message.
+    pub fn pop_front_discarded(&mut self) {
+        if !self.entries.is_empty() {
+            self.entries.remove(0);
+        }
+    }
+
     fn evict_one(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -181,17 +218,21 @@ impl DeliveryOutbox {
     }
 }
 
-/// Decorate `entry.payload` with supersession or overflow context when needed.
-pub fn decorate_payload(entry: &OutboxEntry, dropped_count: usize) -> serde_json::Value {
-    if entry.superseded_count == 0 && dropped_count == 0 {
-        return entry.payload.clone();
+/// Decorate `base` payload with supersession or overflow context when needed.
+pub fn decorate_payload_counts(
+    base: &serde_json::Value,
+    superseded_count: usize,
+    dropped_count: usize,
+) -> serde_json::Value {
+    if superseded_count == 0 && dropped_count == 0 {
+        return base.clone();
     }
 
     let mut notes = Vec::new();
-    if entry.superseded_count > 0 {
+    if superseded_count > 0 {
         notes.push(format!(
             "{} intermediate transition(s) superseded while offline",
-            entry.superseded_count
+            superseded_count
         ));
     }
     if dropped_count > 0 {
@@ -202,7 +243,7 @@ pub fn decorate_payload(entry: &OutboxEntry, dropped_count: usize) -> serde_json
     }
     let note_text = notes.join("; ");
 
-    let mut payload = entry.payload.clone();
+    let mut payload = base.clone();
     if let Some(embed) = payload
         .get_mut("embeds")
         .and_then(serde_json::Value::as_array_mut)
@@ -226,6 +267,11 @@ pub fn decorate_payload(entry: &OutboxEntry, dropped_count: usize) -> serde_json
         }
     }
     payload
+}
+
+/// Decorate `entry.payload` with supersession or overflow context when needed.
+pub fn decorate_payload(entry: &OutboxEntry, dropped_count: usize) -> serde_json::Value {
+    decorate_payload_counts(&entry.payload, entry.superseded_count, dropped_count)
 }
 
 /// Load persisted outbox entries, treating a missing file as an empty queue.
@@ -259,11 +305,15 @@ pub fn save(path: &Path, outbox: &DeliveryOutbox) -> Result<(), String> {
         .map_err(|error| format!("cannot encode delivery outbox: {error}"))?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
     }
 
-    let temp = path.with_extension("json.tmp");
+    let mut temp_os = path.as_os_str().to_os_string();
+    temp_os.push(".tmp");
+    let temp = std::path::PathBuf::from(temp_os);
 
     let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
@@ -288,7 +338,12 @@ pub fn save(path: &Path, outbox: &DeliveryOutbox) -> Result<(), String> {
 #[cfg(unix)]
 fn sync_parent(path: &Path) {
     if let Some(parent) = path.parent() {
-        if let Ok(directory) = std::fs::File::open(parent) {
+        let dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(directory) = std::fs::File::open(dir) {
             let _ = directory.sync_all();
         }
     }
@@ -296,3 +351,107 @@ fn sync_parent(path: &Path) {
 
 #[cfg(not(unix))]
 fn sync_parent(_path: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alerts::state::AlertSeverity;
+
+    #[test]
+    fn outbox_key_from_alert_event_ignores_volatile_telemetry_labels() {
+        let event_a = AlertEvent {
+            timestamp: Utc::now(),
+            metric: MetricKind::MemoryUsage,
+            severity: AlertSeverity::Warning,
+            message: "memory warning".to_string(),
+            value: 86.0,
+            threshold: 85.0,
+            labels: vec![
+                ("available_kb".to_string(), "512000".to_string()),
+                ("instance".to_string(), "orangepi".to_string()),
+                ("mount".to_string(), "/".to_string()),
+            ],
+        };
+
+        let event_b = AlertEvent {
+            timestamp: Utc::now(),
+            metric: MetricKind::MemoryUsage,
+            severity: AlertSeverity::Critical,
+            message: "memory critical".to_string(),
+            value: 96.0,
+            threshold: 95.0,
+            labels: vec![
+                ("mount".to_string(), "/".to_string()),
+                ("available_kb".to_string(), "128000".to_string()),
+                ("instance".to_string(), "orangepi".to_string()),
+            ],
+        };
+
+        let key_a = OutboxKey::from_alert_event(&event_a);
+        let key_b = OutboxKey::from_alert_event(&event_b);
+        assert_eq!(
+            key_a, key_b,
+            "volatile available_kb must not break outbox supersession"
+        );
+
+        let mut different_mount = event_b;
+        different_mount.labels = vec![
+            ("mount".to_string(), "/var/backups".to_string()),
+            ("available_kb".to_string(), "128000".to_string()),
+            ("instance".to_string(), "orangepi".to_string()),
+        ];
+        assert_ne!(
+            key_a,
+            OutboxKey::from_alert_event(&different_mount),
+            "static identity labels (instance, mount) must remain part of OutboxKey"
+        );
+    }
+
+    #[test]
+    fn pop_front_discarded_preserves_dropped_count_until_delivered() {
+        let mut outbox = DeliveryOutbox::with_capacity(1);
+        let now = Utc::now();
+
+        outbox.upsert(
+            OutboxKey::Maintenance {
+                task: "first".to_string(),
+            },
+            OutboxPriority::Active,
+            serde_json::json!({"embeds": [{}]}),
+            now,
+        );
+        // Overflow capacity=1 -> `first` is evicted and `dropped_count` becomes 1.
+        outbox.upsert(
+            OutboxKey::Maintenance {
+                task: "bad_400".to_string(),
+            },
+            OutboxPriority::Active,
+            serde_json::json!({"embeds": [{}]}),
+            now,
+        );
+        assert_eq!(outbox.dropped_count, 1);
+
+        // Permanently rejected 4xx entry is discarded without clearing `dropped_count`.
+        outbox.pop_front_discarded();
+        assert!(outbox.is_empty());
+        assert_eq!(
+            outbox.dropped_count, 1,
+            "discarding a 4xx entry must preserve dropped_count for the next valid delivery"
+        );
+
+        outbox.upsert(
+            OutboxKey::Digest,
+            OutboxPriority::Active,
+            serde_json::json!({"embeds": [{}]}),
+            now,
+        );
+        let (_, dropped_seen) = outbox.peek_front().expect("digest queued");
+        assert_eq!(dropped_seen, 1);
+
+        outbox.pop_front_delivered();
+        assert_eq!(
+            outbox.dropped_count, 0,
+            "successful delivery clears dropped_count"
+        );
+    }
+}
