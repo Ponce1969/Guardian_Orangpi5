@@ -64,6 +64,8 @@ fn systemd_unit_enforces_umask_and_minimal_writable_paths() {
     let unit = std::fs::read_to_string(unit_path).expect("systemd unit exists");
 
     for required in [
+        "After=network-online.target",
+        "EnvironmentFile=-/opt/guardianrs/.env",
         "UMask=0077",
         "ProtectSystem=strict",
         "ProtectHome=true",
@@ -82,6 +84,18 @@ fn systemd_unit_enforces_umask_and_minimal_writable_paths() {
         );
     }
 
+    let lines: Vec<&str> = unit.lines().collect();
+    let unit_section_end = lines
+        .iter()
+        .position(|line| line.trim() == "[Service]")
+        .expect("[Service] section exists");
+    assert!(
+        lines[..unit_section_end]
+            .iter()
+            .any(|line| line.trim() == "StartLimitBurst=3"),
+        "StartLimitBurst=3 must appear in [Unit] before [Service]"
+    );
+
     assert!(
         !unit.contains("SupplementaryGroups=docker"),
         "docker group is root-equivalent and must not be enabled in the default unit"
@@ -97,6 +111,121 @@ fn systemd_unit_enforces_umask_and_minimal_writable_paths() {
     );
 }
 
+#[test]
+fn deployment_scripts_and_gitattributes_enforce_security_hygiene() {
+    let deploy = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/deploy.sh"))
+        .expect("deploy.sh exists");
+    assert!(
+        deploy.contains(
+            r#"install -m 0600 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "$ENV_SOURCE" "${INSTALL_DIR}/.env""#
+        ),
+        "deploy.sh must install .env atomically with mode 0600 and service ownership"
+    );
+    assert!(
+        !deploy.contains(r#"cp "$ENV_SOURCE" "${INSTALL_DIR}/.env""#),
+        "deploy.sh must not create .env world-readable via cp before chmod"
+    );
+    assert!(
+        deploy.contains("FORCE_ENV_OVERWRITE"),
+        "deploy.sh must preserve existing production .env unless explicitly overridden"
+    );
+    assert!(
+        deploy.contains(r#"chmod 700 "$BACKUP_DIR" "${BACKUP_DIR}/postgres" "$STATE_DIR""#),
+        "deploy.sh must enforce 0700 on backup and state directories"
+    );
+
+    let verify_restore = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/verify-restore.sh"
+    ))
+    .expect("verify-restore.sh exists");
+    assert!(verify_restore.contains("GUARDIAN_PG_AUDITOR_PASSWORD"));
+    assert!(verify_restore.contains("GUARDIAN_PG_PASSWORD"));
+    assert!(verify_restore.contains("strip_outer_quotes"));
+    assert!(verify_restore.contains("guardianrs-${PROTECTED_DB}-"));
+    assert!(
+        verify_restore.contains("{{println $name}}") && verify_restore.contains("| head -1"),
+        "verify-restore.sh must isolate a single Docker network name"
+    );
+    assert!(
+        verify_restore.contains(r#"-v "$DUMP_DIR_ARG:$DUMP_DIR_ARG:ro""#)
+            && verify_restore.contains(r#"test -f "$DUMP_PATH" && test -s "$DUMP_PATH""#),
+        "verify-restore.sh must mount parent dir read-only and verify regular non-empty file"
+    );
+    assert!(
+        !verify_restore.contains(r#"-v "$DUMP:$DUMP:ro""#),
+        "mounting a missing file path directly makes dockerd create a root:root directory"
+    );
+
+    let verify_creds = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/verify-credentials.sh"
+    ))
+    .expect("verify-credentials.sh exists");
+    assert!(verify_creds.contains("strip_outer_quotes"));
+
+    let gitattributes =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.gitattributes"))
+            .expect(".gitattributes exists");
+    for required_rule in [
+        "*.sh text eol=lf",
+        "*.service text eol=lf",
+        "*.yaml text eol=lf",
+        "*.yml text eol=lf",
+    ] {
+        assert!(
+            gitattributes
+                .lines()
+                .any(|line| line.trim() == required_rule),
+            "missing .gitattributes LF rule: {required_rule}"
+        );
+    }
+}
+
+async fn read_http_body(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 2048];
+    let mut header_end: Option<usize> = None;
+    let mut content_length: usize = 0;
+
+    loop {
+        let n = match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+
+        if header_end.is_none() {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let end = pos + 4;
+                header_end = Some(end);
+                let headers = String::from_utf8_lossy(&buf[..pos]);
+                for line in headers.lines() {
+                    if let Some((name, val)) = line.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = val.trim().parse::<usize>().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(end) = header_end {
+            if buf.len() >= end + content_length {
+                return String::from_utf8_lossy(&buf[end..end + content_length]).to_string();
+            }
+        }
+    }
+
+    if let Some(end) = header_end {
+        String::from_utf8_lossy(&buf[end..]).to_string()
+    } else {
+        String::new()
+    }
+}
+
 #[tokio::test]
 async fn end_to_end_collect_transition_outbox_and_digest_reaches_webhook() {
     use std::sync::{
@@ -104,7 +233,7 @@ async fn end_to_end_collect_transition_outbox_and_digest_reaches_webhook() {
         Arc, Mutex,
     };
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::watch;
 
     use async_trait::async_trait;
@@ -157,13 +286,9 @@ async fn end_to_end_collect_transition_outbox_and_digest_reaches_webhook() {
     let payloads_srv = Arc::clone(&payloads);
     let server = tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
-            let mut buf = vec![0u8; 16384];
-            let n = socket.read(&mut buf).await.unwrap_or(0);
-            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = read_http_body(&mut socket).await;
             if online_srv.load(Ordering::SeqCst) {
-                if let Some((_, body)) = text.split_once("\r\n\r\n") {
-                    payloads_srv.lock().expect("lock").push(body.to_string());
-                }
+                payloads_srv.lock().expect("lock").push(body);
                 let _ = socket
                     .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     .await;

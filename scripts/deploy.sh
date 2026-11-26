@@ -96,8 +96,7 @@ if [[ -f "${INSTALL_DIR}/.env" && "${FORCE_ENV_OVERWRITE:-0}" != "1" ]]; then
     chmod 600 "${INSTALL_DIR}/.env"
 elif [[ -f "$ENV_SOURCE" ]]; then
     log_info "Installing .env file..."
-    cp "$ENV_SOURCE" "${INSTALL_DIR}/.env"
-    chmod 600 "${INSTALL_DIR}/.env"
+    install -m 0600 -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" "$ENV_SOURCE" "${INSTALL_DIR}/.env"
     log_info ".env installed (permissions: 600)"
 else
     log_warn ".env not found at ${ENV_SOURCE}, skipping (service will use system env vars)"

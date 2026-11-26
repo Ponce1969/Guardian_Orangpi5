@@ -213,10 +213,12 @@ weight for expressiveness nothing asks for.
 
 ### Rule: every task has a hard deadline, and the deadline kills the tree
 
-- `timeout_secs` is **required**. There is no default, because a default is a
-  runaway operation nobody decided to allow.
-- `grace_secs` defaults to `5`: the window between asking a process to stop and
-  forcing it.
+- `timeout_secs` defaults to `1800` and must be `> 0`: the deadline for the
+  dump and full restore verification (`pg_restore --file -`).
+- `grace_secs` defaults to `30`: the window between asking a process group to
+  stop and forcing it.
+- `verify_timeout_secs` defaults to `120` and must be `> 0`: the metadata read
+  deadline for `pg_restore --list`.
 
 Execution sequence:
 

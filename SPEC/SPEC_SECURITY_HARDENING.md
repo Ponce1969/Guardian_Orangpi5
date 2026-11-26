@@ -7,7 +7,7 @@
 - **Rule of truth:** This document distinguishes what the codebase **does at the
   baseline commit** (`VIOLATED`, `ABSENT`, `DIVERGES`, `DEBT`) from the target
   invariants (`I1`–`I5`). Every normative `MUST` maps to at least one named
-  automated test in the Traceability Matrix below. No `MUST` is valid without a
+  automated test in the Baseline Audit Table below. No `MUST` is valid without a
   test that fails when the invariant is broken.
 
 Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
@@ -22,17 +22,17 @@ Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
 | **I1.1** | `AlertKey` hashes static identity labels only | **VIOLATED** (live bug) | `src/alerts/state.rs:66-79` hashes all `snapshot.labels`; `memory.rs:190`, `disk.rs:164`, `docker.rs:155-169` attach per-tick telemetry (`available_kb`, `available_bytes`, `running`, `*_gb`). | `alerts::state::tests::telemetry_labels_do_not_change_alert_key`, `tests/per_instance_alerts.rs::collector_telemetry_labels_deduplicate_and_recover` |
 | **I1.2** | Zero tracker retention for `Normal` series | **VIOLATED** (live leak) | `src/alerts/state.rs:123-140` inserts every unseen key into `HashMap` even when `new_state == Normal`. | `alerts::state::tests::normal_state_retains_zero_entries_in_tracker` |
 | **I1.3** | `Critical -> Warning` emits `Warning`, never `Recovered` | **VIOLATED** (inverted) | `src/alerts/engine.rs:109` maps `(Critical, Warning) => AlertSeverity::Recovered` ("recovered below warning" while above warning). | `alerts::engine::tests::critical_to_warning_emits_warning_not_recovered` |
-| **I2.1** | Every external socket, query, and HTTP call has a deadline | **ABSENT** | `src/notifiers/discord.rs:100` uses unbounded `reqwest::Client::new()`; `postgres.rs:166` awaits `simple_query` without deadline; `docker.rs:283,294` await Bollard without deadline. | `notifiers::discord::tests::stalled_webhook_times_out_within_deadline`, `collectors::postgres::tests::stalled_query_times_out_as_failed_probe` |
+| **I2.1** | Every external socket, query, and HTTP call has a deadline | **ABSENT** | `src/notifiers/discord.rs:100` uses unbounded `reqwest::Client::new()`; `postgres.rs:166` awaits `simple_query` without deadline; `docker.rs:283,294` await Bollard without deadline. | `notifiers::discord::tests::stalled_webhook_times_out_within_deadline`, `collectors::postgres::tests::stalled_query_times_out_as_failed_probe`, `collectors::docker::tests::stalled_docker_calls_time_out_within_deadline` |
 | **I2.2** | Durable at-least-once delivery outbox with supersession and bounded capacity | **ABSENT** | `src/notifiers/discord.rs:173-197` fires once and drops on `5xx`/`429`/network blip after `AlertEngine` already consumed the transition. | `notifiers::discord::tests::outbox_supersedes_by_key_and_records_skipped_transitions`, `notifiers::discord::tests::outbox_persists_across_restart_and_enforces_capacity` |
 | **I2.3** | Independent orchestrator `flush` phase on every tick | **ABSENT** | `src/services/orchestrator.rs:324-353` returns early on empty snapshots, startup grace, or `events.is_empty()`, preventing queued alerts from draining when collectors fail or state is steady. | `services::orchestrator::tests::flush_runs_even_when_collectors_fail_or_emit_no_events` |
-| **I2.4** | Fail-fast startup config bounds (`poll_interval_secs >= 1`, ordered finite thresholds, valid `digest.daily_at`, path-safe DB names) | **ABSENT** | `src/services/orchestrator.rs:101` panics `tokio::time::interval` when `poll_interval_secs == 0`; `src/config.rs:235-286` accepts `NaN` or `warning >= critical`; `database` allows `/` or `..`. | `config::tests::zero_poll_interval_is_rejected`, `config::tests::inverted_or_non_finite_thresholds_are_rejected`, `config::tests::path_separators_in_database_or_instance_are_rejected` |
+| **I2.4** | Fail-fast startup config bounds (`poll_interval_secs >= 1`, ordered finite thresholds, valid `digest.daily_at`, path-safe DB names) | **ABSENT** | `src/services/orchestrator.rs:101` panics `tokio::time::interval` when `poll_interval_secs == 0`; `src/config.rs:235-286` accepts `NaN` or `warning >= critical`; `database` allows `/` or `..`. | `config::tests::zero_poll_interval_is_rejected`, `config::tests::inverted_or_non_finite_thresholds_are_rejected`, `config::tests::path_separators_in_database_or_instance_are_rejected`, `config::tests::invalid_digest_daily_at_is_rejected`, `config::tests::negative_non_temperature_thresholds_are_rejected`, `config::tests::duplicate_maintenance_task_names_are_rejected` |
 | **I3.1** | Transport errors strip secret URLs and cap response bodies | **VIOLATED** (active leak) | `src/notifiers/discord.rs:180-193` formats `reqwest::Error` with URL/token into `journald` and reads unbounded `response.text()`. | `notifiers::discord::tests::transport_failure_never_contains_webhook_url_or_token`, `notifiers::discord::tests::webhook_error_body_is_bounded` |
 | **I3.2** | Secret-bearing config structs redact `Debug` | **DEBT** (no active `{:?}` in `src/`) | `src/config.rs:34,315,357,362` derive `Debug` over `resolved_password` and `resolved_webhook_url`. Zero `{:?}` call sites exist in `src/` at `a4348d7`, so this is latent debt rather than an active leak. | `config::tests::debug_output_redacts_webhook_url_and_postgres_passwords` |
-| **I3.3** | HTTPS Discord webhook validation and config-paired `.env` | **ABSENT / DIVERGES** | `src/config.rs:415-423` accepts plaintext `http://` or arbitrary hosts; `src/main.rs:26` loads CWD `.env` unconditionally (systemd `EnvironmentFile` works, manual CLI from another directory diverges). | `config::tests::webhook_url_rejects_non_https_or_foreign_hosts` |
+| **I3.3** | HTTPS Discord webhook validation and config-paired `.env` | **ABSENT / DIVERGES** | `src/config.rs:415-423` accepts plaintext `http://` or arbitrary hosts; `src/main.rs:26` loads CWD `.env` unconditionally (systemd `EnvironmentFile` works, manual CLI from another directory diverges). | `config::tests::webhook_url_rejects_non_https_or_foreign_hosts`, `config::tests::startup_and_persistence_paths_resolve_deterministically` |
 | **I4.1** | Non-amplifying `pg_restore` verification (`--file -` to null) and real task identity | **DIVERGES** | `src/services/maintenance/backup_task.rs:246` hardcodes `"postgres_backup"`; `backup.rs:264-272` writes cleartext SQL to `<temp>.restore` (pinned by existing test `verification_reads_the_file_without_credentials` at `backup.rs:560`); `backup_task.rs:136` skips `discard()` on verify spawn error. | `services::maintenance::backup::tests::verification_streams_to_null_without_temp_file`, `services::maintenance::backup_task::tests::outcome_carries_configured_task_name_and_cleans_partials` |
 | **I4.2** | Daily human liveness digest (`08:00` local, DST-safe, persisted, late catch-up, failure-only collector summary) | **ABSENT** | No heartbeat or daily digest exists; silence on Discord is indistinguishable from a dead daemon or broken webhook. | `services::digest::tests::daily_digest_handles_dst_transitions_once_per_date`, `services::digest::tests::digest_persists_across_restart_and_marks_late_catchup`, `services::digest::tests::digest_reports_unrun_tasks_as_did_not_run_and_failed_collectors_only` |
 | **I5.1** | Docker opt-in default (`false`) | **DIVERGES** (inverted) | `src/config.rs:64-71` defaults `docker.enabled` to `true` when omitted. | `config::tests::docker_collector_is_disabled_by_default_when_omitted` |
-| **I5.2** | Systemd `UMask=0077`, clean `ReadWritePaths`, safe `deploy.sh` & `verify-restore.sh`, LF `.gitattributes` | **DIVERGES / ABSENT** | `systemd/guardianrs.service:25` grants `ReadWritePaths=/proc /sys` and lacks `UMask=0077`; `deploy.sh` omits `0700` state/backup dirs and overwrites `.env`; `verify-restore.sh:38,60` uses legacy var and `sh -c` path interpolation. | `tests/production_config.rs::systemd_unit_enforces_umask_and_minimal_writable_paths` |
+| **I5.2** | Systemd `UMask=0077`, clean `ReadWritePaths`, safe `deploy.sh` & `verify-restore.sh`, LF `.gitattributes` | **DIVERGES / ABSENT** | `systemd/guardianrs.service:25` grants `ReadWritePaths=/proc /sys` and lacks `UMask=0077`; `deploy.sh` omits `0700` state/backup dirs and overwrites `.env`; `verify-restore.sh:38,60` uses legacy var and `sh -c` path interpolation. | `tests/production_config.rs::systemd_unit_enforces_umask_and_minimal_writable_paths`, `tests/production_config.rs::deployment_scripts_and_gitattributes_enforce_security_hygiene` |
 
 ---
 
@@ -71,7 +71,9 @@ Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
 
 1. **No unbounded external await (`MUST`):** Every network connect, HTTP
    request, SQL probe (`connect` + `SELECT 1`), and Docker socket call MUST
-   execute under an explicit timeout smaller than the poll cycle budget.
+   execute under an explicit timeout whose worst-case retry sequence stays
+   strictly smaller than the `30s` poll cycle budget (`3s` connect, `5s`
+   request, `500ms`/`1s` backoff, `2s` `Retry-After` cap -> `<= 19s` worst case).
 2. **Durable delivery outbox (`MUST`):** When `DiscordNotifier` fails to deliver
    an alert, maintenance outcome, or digest after quick transport retries on
    transient errors (`5xx`, `429`, timeout/network error; non-`429` `4xx` errors
@@ -180,7 +182,7 @@ Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
         collectors that failed since the previous digest with their failure
         counts, or one line (`No collector failures`) when none failed.
      2. *Active alerts:* Any metric series currently in `Warning` or `Critical`
-        (or `No active alerts`).
+        (or `No open alerts`).
      3. *Nightly maintenance:* Assumes the overnight maintenance window closed
         before `08:00` and renders one explicit line **per configured task**. A
         task that is still pending, still running, or was `Skipped` at digest
@@ -220,9 +222,9 @@ structural `MUST` invariants above so tuning them never invalidates the spec:
 
 | Parameter | Default | Scope |
 |-----------|---------|-------|
-| Discord HTTP `connect_timeout` | `5s` | `DiscordNotifier` |
-| Discord HTTP `request_timeout` | `10s` | `DiscordNotifier` |
-| Discord immediate retry attempts | `2` (`1s`, `2s` backoff; honors `Retry-After` capped at `5s`) before spooling to durable outbox | `DiscordNotifier` |
+| Discord HTTP `connect_timeout` | `3s` | `DiscordNotifier` |
+| Discord HTTP `request_timeout` | `5s` | `DiscordNotifier` |
+| Discord immediate retry attempts | `2` (`500ms`, `1s` backoff; honors `Retry-After` capped at `2s`) before spooling to durable outbox | `DiscordNotifier` |
 | Discord error body log cap | `512` chars | `DiscordNotifier` |
 | Durable outbox capacity | `64` entries (`/var/lib/guardianrs/outbox.json`) | `DiscordNotifier` / `Orchestrator` |
 | Docker `list_containers` / `df` timeout | `5s` / `15s` | `DockerCollector` |

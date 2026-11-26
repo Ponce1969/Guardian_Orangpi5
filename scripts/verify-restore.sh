@@ -35,8 +35,22 @@ say() { printf '\n== %s\n' "$1"; }
 [ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE (needs the PostgreSQL password)"
 command -v docker >/dev/null || die "docker is not available"
 
+strip_outer_quotes() {
+    local val="$1"
+    if [[ ${#val} -ge 2 ]]; then
+        if [[ "${val:0:1}" == '"' && "${val: -1}" == '"' ]]; then
+            val="${val:1:${#val}-2}"
+        elif [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]]; then
+            val="${val:1:${#val}-2}"
+        fi
+    fi
+    printf '%s' "$val"
+}
+
 read_env_var() {
-    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' || true
+    local raw
+    raw="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' || true)"
+    strip_outer_quotes "$raw"
 }
 
 PGPASSWORD="$(read_env_var "$PASSWORD_ENV")"
@@ -46,9 +60,11 @@ fi
 [ -n "$PGPASSWORD" ] || die "$PASSWORD_ENV is empty in $ENV_FILE"
 
 IMAGE="$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')"
-NETWORK="$(docker inspect "$CONTAINER" --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{end}}')"
-PG_USER="$(docker inspect "$CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^POSTGRES_USER=//p' | head -1)"
-PG_USER="${PG_USER:-postgres}"
+NETWORK="$(docker inspect "$CONTAINER" --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' | head -1)"
+if [ -z "${PG_USER:-}" ]; then
+    PG_USER="$(docker inspect "$CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^POSTGRES_USER=//p' | head -1)"
+    PG_USER="${PG_USER:-postgres}"
+fi
 
 [ -n "$IMAGE" ] || die "cannot read the image of $CONTAINER"
 [ -n "$NETWORK" ] || die "cannot read the network of $CONTAINER"
@@ -58,18 +74,33 @@ DUMP="${1:-}"
 
 if [ -z "$DUMP" ]; then
     say "Locating the newest dump"
-    DUMP="$(docker run --rm -e DUMP_DIR="$DUMP_DIR" -v "$DUMP_DIR:$DUMP_DIR:ro" --entrypoint sh "$IMAGE" \
-        -c 'ls -1t "$DUMP_DIR"/*.dump 2>/dev/null | head -1')" \
+    case "$DUMP_DIR" in
+        /*) ;;
+        *) DUMP_DIR="$(pwd -P)/$DUMP_DIR" ;;
+    esac
+    DUMP="$(docker run --rm -e DUMP_DIR="$DUMP_DIR" -e PROTECTED_DB="$PROTECTED_DB" -v "$DUMP_DIR:$DUMP_DIR:ro" --entrypoint sh "$IMAGE" \
+        -c 'ls -1t "$DUMP_DIR/guardianrs-${PROTECTED_DB}-"*.dump 2>/dev/null | head -1')" \
         || die "cannot list $DUMP_DIR"
-    [ -n "$DUMP" ] || die "no .dump file in $DUMP_DIR"
+    [ -n "$DUMP" ] || die "no guardianrs-${PROTECTED_DB}-*.dump file in $DUMP_DIR"
+else
+    case "$DUMP" in
+        /*) ;;
+        *) DUMP="$(pwd -P)/$DUMP" ;;
+    esac
+    if command -v realpath >/dev/null 2>&1; then
+        DUMP="$(realpath -m "$DUMP" 2>/dev/null || printf '%s' "$DUMP")"
+    fi
 fi
 
-[ -f "$DUMP" ] || [ -n "$(docker run --rm -e DUMP_PATH="$DUMP" -v "$DUMP:$DUMP:ro" --entrypoint sh "$IMAGE" \
-    -c 'test -s "$DUMP_PATH" && echo present' 2>/dev/null)" ] \
+DUMP_DIR_ARG="$(dirname "$DUMP")"
+[ -n "$DUMP_DIR_ARG" ] && [[ "$DUMP_DIR_ARG" == /* ]] || die "invalid dump directory for $DUMP"
+
+[ -f "$DUMP" ] && [ -s "$DUMP" ] || [ -n "$(docker run --rm -e DUMP_PATH="$DUMP" -v "$DUMP_DIR_ARG:$DUMP_DIR_ARG:ro" --entrypoint sh "$IMAGE" \
+    -c 'test -f "$DUMP_PATH" && test -s "$DUMP_PATH" && echo present' 2>/dev/null)" ] \
     || die "$DUMP does not exist or is empty"
 
 say "Dump: $DUMP"
-docker run --rm -e DUMP_PATH="$DUMP" -v "$DUMP:$DUMP:ro" --entrypoint sh "$IMAGE" \
+docker run --rm -e DUMP_PATH="$DUMP" -v "$DUMP_DIR_ARG:$DUMP_DIR_ARG:ro" --entrypoint sh "$IMAGE" \
     -c 'ls -l "$DUMP_PATH"' || true
 
 # --- Target -----------------------------------------------------------------
@@ -112,7 +143,7 @@ say "Restoring"
 # fresh database, and the question here is whether the data comes back, not
 # whether the ownership graph does.
 if docker run --rm --network "$NETWORK" \
-    -v "$DUMP:$DUMP:ro" -e PGPASSWORD="$PGPASSWORD" --entrypoint pg_restore "$IMAGE" \
+    -v "$DUMP_DIR_ARG:$DUMP_DIR_ARG:ro" -e PGPASSWORD="$PGPASSWORD" --entrypoint pg_restore "$IMAGE" \
     -h "$CONTAINER" -U "$PG_USER" -d "$TEST_DB" \
     --no-owner --no-privileges "$DUMP"; then
     echo "pg_restore exited 0"

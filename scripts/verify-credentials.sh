@@ -33,8 +33,22 @@ fi
 
 command -v psql >/dev/null || { printf 'error: psql is not installed\n' >&2; exit 2; }
 
+strip_outer_quotes() {
+    local val="$1"
+    if [[ ${#val} -ge 2 ]]; then
+        if [[ "${val:0:1}" == '"' && "${val: -1}" == '"' ]]; then
+            val="${val:1:${#val}-2}"
+        elif [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]]; then
+            val="${val:1:${#val}-2}"
+        fi
+    fi
+    printf '%s' "$val"
+}
+
 read_var() {
-    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r'
+    local raw
+    raw="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' || true)"
+    strip_outer_quotes "$raw"
 }
 
 port_open() {
