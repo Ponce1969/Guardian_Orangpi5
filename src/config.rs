@@ -752,6 +752,14 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
                 env::var(&instance.password_env).map_err(|_| ConfigError::MissingEnv {
                     var: instance.password_env.clone(),
                 })?;
+            if password.is_empty() {
+                return Err(ConfigError::Invalid {
+                    details: format!(
+                        "postgres instance {:?}: environment variable {} must not be empty",
+                        instance.name, instance.password_env
+                    ),
+                });
+            }
             instance.resolved_password = Some(password);
         }
     }
@@ -783,6 +791,16 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
 
         for task in &config.maintenance.tasks {
             validate_safe_identifier("maintenance task name", &task.name)?;
+            if task.destination_dir.trim().is_empty()
+                || task.destination_dir.chars().any(char::is_control)
+            {
+                return Err(ConfigError::Invalid {
+                    details: format!(
+                        "task {:?}: destination_dir must be non-empty and free of control characters",
+                        task.name
+                    ),
+                });
+            }
             if let Some(database) = &task.database {
                 validate_safe_identifier("maintenance task database", database)?;
             }
@@ -1370,5 +1388,32 @@ postgres:
                 Some(PathBuf::from("/custom/outbox.json"))
             )
         );
+    }
+
+    #[test]
+    fn empty_postgres_password_or_destination_dir_is_rejected() {
+        const VAR: &str = "GUARDIAN_TEST_EMPTY_PG_PASS";
+        std::env::set_var(VAR, "");
+
+        let empty_pass_yaml = format!(
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: nutrition\n      host: 127.0.0.1\n      port: 5438\n      database: nutrition_udelar\n      user: nutrition_app\n      password_env: {VAR}\n"
+        );
+        let pass_err = load_from_temp(&empty_pass_yaml).expect_err("empty PG password must fail");
+        assert!(
+            pass_err.to_string().contains("must not be empty"),
+            "error was: {pass_err}"
+        );
+
+        std::env::set_var(VAR, "s3cret");
+        let empty_dir_yaml = format!(
+            "{LEGACY_YAML}\npostgres:\n  enabled: true\n  instances:\n    - name: nutrition\n      host: 127.0.0.1\n      port: 5438\n      database: nutrition_udelar\n      user: nutrition_app\n      password_env: {VAR}\nmaintenance:\n  enabled: true\n  tasks:\n    - name: nutrition_nightly\n      kind: postgres_backup\n      daily_at: '03:45'\n      instance: nutrition\n      destination_dir: '   '\n"
+        );
+        let dir_err = load_from_temp(&empty_dir_yaml).expect_err("blank destination_dir must fail");
+        assert!(
+            dir_err.to_string().contains("destination_dir"),
+            "error was: {dir_err}"
+        );
+
+        std::env::remove_var(VAR);
     }
 }

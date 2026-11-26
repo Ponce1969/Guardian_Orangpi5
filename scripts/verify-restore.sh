@@ -79,7 +79,7 @@ if [ -z "$DUMP" ]; then
         *) DUMP_DIR="$(pwd -P)/$DUMP_DIR" ;;
     esac
     DUMP="$(docker run --rm -e DUMP_DIR="$DUMP_DIR" -e PROTECTED_DB="$PROTECTED_DB" -v "$DUMP_DIR:$DUMP_DIR:ro" --entrypoint sh "$IMAGE" \
-        -c 'ls -1t "$DUMP_DIR/guardianrs-${PROTECTED_DB}-"*.dump 2>/dev/null | head -1')" \
+        -c 'test -d "$DUMP_DIR" && { ls -1t "$DUMP_DIR/guardianrs-${PROTECTED_DB}-"*.dump 2>/dev/null | head -1 || true; }')" \
         || die "cannot list $DUMP_DIR"
     [ -n "$DUMP" ] || die "no guardianrs-${PROTECTED_DB}-*.dump file in $DUMP_DIR"
 else
@@ -111,7 +111,7 @@ TEST_DB="auditor_restore_test_$(date +%Y%m%d%H%M%S)"
 
 psql_as() {
     local database="$1"; shift
-    docker exec -i -e PGPASSWORD="$PGPASSWORD" "$CONTAINER" \
+    PGPASSWORD="$PGPASSWORD" docker exec -i -e PGPASSWORD "$CONTAINER" \
         psql -U "$PG_USER" -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 
@@ -142,8 +142,8 @@ say "Restoring"
 # --no-owner and --no-privileges: the roles the dump names may not exist in a
 # fresh database, and the question here is whether the data comes back, not
 # whether the ownership graph does.
-if docker run --rm --network "$NETWORK" \
-    -v "$DUMP_DIR_ARG:$DUMP_DIR_ARG:ro" -e PGPASSWORD="$PGPASSWORD" --entrypoint pg_restore "$IMAGE" \
+if PGPASSWORD="$PGPASSWORD" docker run --rm --network "$NETWORK" \
+    -v "$DUMP_DIR_ARG:$DUMP_DIR_ARG:ro" -e PGPASSWORD --entrypoint pg_restore "$IMAGE" \
     -h "$CONTAINER" -U "$PG_USER" -d "$TEST_DB" \
     --no-owner --no-privileges "$DUMP"; then
     echo "pg_restore exited 0"

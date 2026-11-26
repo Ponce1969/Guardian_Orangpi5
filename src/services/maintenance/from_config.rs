@@ -92,6 +92,14 @@ fn one_task(
         ));
     }
 
+    if task.destination_dir.trim().is_empty() || task.destination_dir.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "task {}: destination_dir must be non-empty and free of control characters",
+            task.name
+        ));
+    }
+
     let password = instance
         .password()
         .map_err(|error| format!("task {}: {error}", task.name))?;

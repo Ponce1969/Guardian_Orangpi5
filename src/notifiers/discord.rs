@@ -680,7 +680,12 @@ impl Notifier for DiscordNotifier {
         let mut processed: usize = 0;
         let mut last_error: Option<NotifierError> = None;
 
-        while processed < MAX_FLUSH_BATCH_PER_TICK && started.elapsed() < MAX_FLUSH_DURATION {
+        while processed < MAX_FLUSH_BATCH_PER_TICK {
+            let remaining = MAX_FLUSH_DURATION.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
             let Some(payload) = guard
                 .peek_front()
                 .map(|(entry, dropped)| decorate_payload(entry, dropped))
@@ -688,13 +693,13 @@ impl Notifier for DiscordNotifier {
                 break;
             };
 
-            match self.dispatch_with_retries(&payload).await {
-                Ok(()) => {
+            match tokio::time::timeout(remaining, self.dispatch_with_retries(&payload)).await {
+                Ok(Ok(())) => {
                     guard.pop_front_delivered();
                     self.persist_outbox_snapshot(guard.clone()).await;
                     processed += 1;
                 }
-                Err(DispatchFailure::Permanent(error)) => {
+                Ok(Err(DispatchFailure::Permanent(error))) => {
                     // Drop unrecoverable 4xx payloads rather than blocking the
                     // entire queue forever, logging loudly while preserving dropped_count.
                     error!(%error, "Dropping permanently rejected Discord outbox entry");
@@ -703,8 +708,14 @@ impl Notifier for DiscordNotifier {
                     last_error = Some(error);
                     processed += 1;
                 }
-                Err(DispatchFailure::Retryable { error, .. }) => {
+                Ok(Err(DispatchFailure::Retryable { error, .. })) => {
                     last_error = Some(error);
+                    break;
+                }
+                Err(_elapsed) => {
+                    last_error = Some(NotifierError::SendFailed {
+                        reason: "Discord outbox flush time budget reached; remaining entries deferred to next tick".to_string(),
+                    });
                     break;
                 }
             }

@@ -145,6 +145,14 @@ fn deployment_scripts_and_gitattributes_enforce_security_hygiene() {
     assert!(verify_restore.contains("strip_outer_quotes"));
     assert!(verify_restore.contains("guardianrs-${PROTECTED_DB}-"));
     assert!(
+        !verify_restore.contains(r#"-e PGPASSWORD="$PGPASSWORD""#),
+        "verify-restore.sh must never pass PGPASSWORD value in docker argv"
+    );
+    assert!(
+        verify_restore.contains(r#"PGPASSWORD="$PGPASSWORD" docker"#),
+        "verify-restore.sh must inherit PGPASSWORD via child process environment"
+    );
+    assert!(
         verify_restore.contains("{{println $name}}") && verify_restore.contains("| head -1"),
         "verify-restore.sh must isolate a single Docker network name"
     );
