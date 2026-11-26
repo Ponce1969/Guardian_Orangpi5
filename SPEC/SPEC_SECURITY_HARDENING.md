@@ -139,8 +139,8 @@ Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
 
 1. **Zero-amplification backup verification and real task identity (`MUST`):**
    - `MaintenanceOutcome.task` MUST carry the configured `ScheduledTask.name`
-     (`auditor_nightly`, `pedidos_nightly`, `ecommerce_nightly`), never a
-     hardcoded `"postgres_backup"` literal.
+     (`auditor_nightly`, `pedidos_nightly`, `ecommerce_nightly`,
+     `nutrition_nightly`), never a hardcoded `"postgres_backup"` literal.
    - `BackupPlan` MUST verify archive data by running
      `pg_restore --file - <partial>` with child `stdout` attached to
      `Stdio::null()` (capturing `stderr` only), writing **zero** temporary
@@ -153,7 +153,7 @@ Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
      MUST remove `<partial>`, and `BackupTask` MUST sweep stale
      `guardianrs-<database>-*.dump.partial` files for its own database.
 2. **Daily human liveness digest (`MUST`):**
-   - **Separation of concerns:** Nightly maintenance (`03:30`–`03:40`) is machine
+   - **Separation of concerns:** Nightly maintenance (`03:30`–`03:45`) is machine
      time and remains untouched. The digest is a **human signal** defaulting to
      `08:00` local time after the maintenance window closes.
    - **Opt-out only:** Enabled by default (`digest.enabled: true`,
@@ -190,7 +190,7 @@ Derived from and complementary to `AGENTS.md`, `SPEC_PRODUCT.md`,
         omitted, because a missing line reads like success).
    - **Production acceptance gate:** Automated tests prove the code paths,
      whereas operational closure requires observing a real `08:00` digest
-     message delivered to Discord on the target host carrying all 3 configured
+     message delivered to Discord on the target host carrying all 4 configured
      backups, collector failure status, and open alerts. Until that message is
      observed, the end-to-end chain (`collect -> transition -> delivery ->
      digest`) remains unproven in production.

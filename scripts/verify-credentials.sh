@@ -63,6 +63,7 @@ TARGETS=(
     "auditor|127.0.0.1|5442|Gallinal2218|auditor_familiar|GUARDIAN_PG_AUDITOR_PASSWORD|GUARDIAN_PG_PASSWORD"
     "pedidos|127.0.0.1|5445|barraca_user|barraca|GUARDIAN_PG_PEDIDOS_PASSWORD|"
     "ecommerce|127.0.0.1|5446|web2r_prod_user|web_2r_prod|GUARDIAN_PG_ECOMMERCE_PASSWORD|"
+    "nutrition|127.0.0.1|5438|nutrition_app|nutrition_udelar|GUARDIAN_PG_NUTRITION_PASSWORD|"
 )
 
 # Counting tables rather than selecting 1: it proves catalog access and answers

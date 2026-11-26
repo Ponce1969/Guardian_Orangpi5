@@ -11,7 +11,7 @@ use guardian_rs::config;
 use guardian_rs::services::maintenance::scheduled_tasks;
 
 /// The secrets the shipped configuration names in its `_env` fields.
-const SECRETS: [(&str, &str); 4] = [
+const SECRETS: [(&str, &str); 5] = [
     (
         "DISCORD_WEBHOOK_URL",
         "https://discord.com/api/webhooks/000000000000000000/not-a-real-token",
@@ -19,6 +19,7 @@ const SECRETS: [(&str, &str); 4] = [
     ("GUARDIAN_PG_AUDITOR_PASSWORD", "not-a-real-password"),
     ("GUARDIAN_PG_PEDIDOS_PASSWORD", "not-a-real-password"),
     ("GUARDIAN_PG_ECOMMERCE_PASSWORD", "not-a-real-password"),
+    ("GUARDIAN_PG_NUTRITION_PASSWORD", "not-a-real-password"),
 ];
 
 #[test]
@@ -46,8 +47,8 @@ fn the_shipped_configuration_loads_and_its_tasks_are_runnable() {
 
     assert_eq!(
         config.postgres.instances.len(),
-        3,
-        "the shipped configuration watches the three projects"
+        4,
+        "the shipped configuration watches the four projects"
     );
     assert_eq!(tasks.len(), config.maintenance.tasks.len());
     assert!(
