@@ -137,9 +137,15 @@ impl AlertEvaluator for AlertEngine {
             snapshot.kind, severity, snapshot.value, suffix, threshold, suffix,
         );
 
-        if !key.labels().is_empty() {
-            let rendered = key
-                .labels()
+        let mut event_labels: Vec<(String, String)> = snapshot
+            .labels
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        event_labels.sort();
+
+        if !event_labels.is_empty() {
+            let rendered = event_labels
                 .iter()
                 .map(|(name, value)| format!("{name}={value}"))
                 .collect::<Vec<_>>()
@@ -154,7 +160,7 @@ impl AlertEvaluator for AlertEngine {
             message,
             value: snapshot.value,
             threshold,
-            labels: key.labels().to_vec(),
+            labels: event_labels,
         }]
     }
 

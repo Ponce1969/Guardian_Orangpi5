@@ -90,6 +90,8 @@ pub trait DockerApi: Send + Sync {
 /// container.
 pub struct DockerCollector {
     api: Box<dyn DockerApi>,
+    list_timeout: Duration,
+    df_timeout: Duration,
 }
 
 impl DockerCollector {
@@ -103,7 +105,18 @@ impl DockerCollector {
     /// The constructor exists for tests, which supply a fake so the suite never
     /// needs a running daemon.
     pub fn with_api(api: Box<dyn DockerApi>) -> Self {
-        Self { api }
+        Self {
+            api,
+            list_timeout: DOCKER_LIST_TIMEOUT,
+            df_timeout: DOCKER_DF_TIMEOUT,
+        }
+    }
+
+    /// Override `list_containers` and `df` deadlines (used by deterministic tests).
+    pub fn with_timeouts(mut self, list: Duration, df: Duration) -> Self {
+        self.list_timeout = list;
+        self.df_timeout = df;
+        self
     }
 
     /// Classify a container from the daemon's lifecycle state and status text.
@@ -203,11 +216,14 @@ impl Collector for DockerCollector {
 
     /// Report container health and disk usage from a single connection.
     async fn collect_all(&self) -> Result<Vec<MetricSnapshot>, CollectorError> {
-        let containers = tokio::time::timeout(DOCKER_LIST_TIMEOUT, self.api.containers())
+        let containers = tokio::time::timeout(self.list_timeout, self.api.containers())
             .await
             .map_err(|_| CollectorError::Unavailable {
                 name: "docker".to_string(),
-                reason: format!("docker list_containers timed out after {DOCKER_LIST_TIMEOUT:?}"),
+                reason: format!(
+                    "docker list_containers timed out after {:?}",
+                    self.list_timeout
+                ),
             })?
             .map_err(|reason| CollectorError::Unavailable {
                 name: "docker".to_string(),
@@ -218,14 +234,14 @@ impl Collector for DockerCollector {
 
         // Disk usage is secondary: a daemon that answers the container list but
         // not the disk query still leaves the operator with the health signal.
-        match tokio::time::timeout(DOCKER_DF_TIMEOUT, self.api.disk_usage()).await {
+        match tokio::time::timeout(self.df_timeout, self.api.disk_usage()).await {
             Ok(Ok(usage)) => snapshots.push(Self::disk_snapshot(&usage)),
             Ok(Err(reason)) => {
                 warn!(reason = %reason, "Docker disk usage unavailable this cycle");
             }
             Err(_) => {
                 warn!(
-                    timeout_secs = DOCKER_DF_TIMEOUT.as_secs(),
+                    timeout_ms = self.df_timeout.as_millis(),
                     "Docker disk usage timed out this cycle"
                 );
             }
@@ -542,6 +558,47 @@ mod tests {
 
         let snapshots = collector.collect_all().await.expect("health survives");
 
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].kind, MetricKind::DockerUnhealthyContainers);
+        assert_eq!(snapshots[0].value, 1.0);
+    }
+
+    #[tokio::test]
+    async fn stalled_docker_calls_time_out_within_deadline() {
+        struct StalledDocker {
+            stall_list: bool,
+        }
+
+        #[async_trait]
+        impl DockerApi for StalledDocker {
+            async fn containers(&self) -> Result<Vec<Container>, String> {
+                if self.stall_list {
+                    std::future::pending::<Result<Vec<Container>, String>>().await
+                } else {
+                    Ok(vec![container("db", ContainerState::Unhealthy)])
+                }
+            }
+
+            async fn disk_usage(&self) -> Result<DockerDiskUsage, String> {
+                std::future::pending::<Result<DockerDiskUsage, String>>().await
+            }
+        }
+
+        // 1. Stalled `list_containers` degrades to `CollectorError::Unavailable` within deadline.
+        let stalled_list = DockerCollector::with_api(Box::new(StalledDocker { stall_list: true }))
+            .with_timeouts(Duration::from_millis(30), Duration::from_millis(30));
+        let res = tokio::time::timeout(Duration::from_secs(2), stalled_list.collect_all())
+            .await
+            .expect("list_containers timeout must prevent hanging");
+        assert!(matches!(res, Err(CollectorError::Unavailable { .. })));
+
+        // 2. Healthy `list_containers` + stalled `df` still emits container health within deadline.
+        let stalled_df = DockerCollector::with_api(Box::new(StalledDocker { stall_list: false }))
+            .with_timeouts(Duration::from_millis(30), Duration::from_millis(30));
+        let snapshots = tokio::time::timeout(Duration::from_secs(2), stalled_df.collect_all())
+            .await
+            .expect("df timeout must prevent hanging")
+            .expect("container health survives stalled df");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].kind, MetricKind::DockerUnhealthyContainers);
         assert_eq!(snapshots[0].value, 1.0);

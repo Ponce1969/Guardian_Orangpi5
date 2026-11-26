@@ -24,15 +24,19 @@ use guardian_rs::services::maintenance::{
 use guardian_rs::services::orchestrator::{Orchestrator, OrchestratorDeps};
 
 fn main() -> Result<()> {
+    #[cfg(unix)]
+    // SAFETY: `libc::umask` is async-signal-safe and sets the process file-creation
+    // mask before any files, logs, or Tokio worker threads are created, ensuring
+    // manual CLI runs enforce `0077` even outside systemd's `UMask=0077`.
+    unsafe {
+        libc::umask(0o077);
+    }
+
     // Select configuration root first so optional .env fallback pairs with the
     // active config file rather than trusting the caller's working directory (I3.3).
-    let config_path = if std::path::Path::new("/opt/guardianrs/guardian.yaml").exists() {
-        dotenvy::from_path("/opt/guardianrs/.env").ok();
-        "/opt/guardianrs/guardian.yaml"
-    } else {
-        dotenvy::dotenv().ok();
-        "configs/guardian.yaml"
-    };
+    let is_production = std::path::Path::new(config::PROD_CONFIG_PATH).exists();
+    let (config_path, env_path) = config::resolve_startup_files(is_production);
+    dotenvy::from_path(env_path).ok();
 
     // Initialize tracing subscriber.
     // Default level is info — clean, production-ready output.
@@ -107,6 +111,8 @@ fn main() -> Result<()> {
         "Alert engine initialized"
     );
 
+    let (state_path, outbox_path) = config::resolve_persistence_paths(is_production, &config);
+
     // === Notifiers ===
     let mut notifiers: Vec<Box<dyn Notifier>> = vec![Box::new(LogNotifier::new())];
 
@@ -115,20 +121,6 @@ fn main() -> Result<()> {
         let hostname = gethostname::gethostname()
             .into_string()
             .unwrap_or_else(|_| "unknown".to_string());
-        let outbox_path = config
-            .notification
-            .discord
-            .outbox_path
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                config
-                    .maintenance
-                    .state_path
-                    .as_ref()
-                    .and_then(|state| std::path::Path::new(state).parent())
-                    .map(|dir| dir.join("outbox.json"))
-            });
 
         let mut discord = DiscordNotifier::new(webhook_url, hostname);
         if let Some(path) = outbox_path {
@@ -195,11 +187,7 @@ fn main() -> Result<()> {
         maintenance,
         executor: Box::new(ProcessExecutor::new()),
         startup_grace: std::time::Duration::from_secs(config.daemon.startup_grace_secs),
-        state_path: config
-            .maintenance
-            .state_path
-            .as_ref()
-            .map(std::path::PathBuf::from),
+        state_path,
         digest_at,
     });
 

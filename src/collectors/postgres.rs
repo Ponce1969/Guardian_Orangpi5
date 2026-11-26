@@ -169,6 +169,16 @@ impl Collector for PostgresCollector {
     }
 }
 
+/// RAII guard that aborts a spawned background task even when an outer
+/// `tokio::time::timeout` cancels the enclosing future mid-await (`I2.1`).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The only place that mentions `tokio_postgres`.
 struct TokioPostgres {
     config: tokio_postgres::Config,
@@ -183,9 +193,9 @@ impl PostgresApi for TokioPostgres {
             .await
             .map_err(|e| format!("postgres connect failed: {e}"))?;
 
-        // The connection future drives the socket; it ends when the client is
-        // dropped, and aborting is the belt to that braces.
-        let connection_task = tokio::spawn(connection);
+        // Wrapped in `AbortOnDrop` so cancelling `probe()` on query timeout
+        // aborts the spawned socket task immediately rather than detaching it.
+        let _connection_guard = AbortOnDrop(tokio::spawn(connection));
 
         let result = client
             .simple_query("SELECT 1")
@@ -193,7 +203,6 @@ impl PostgresApi for TokioPostgres {
             .map_err(|e| format!("postgres query failed: {e}"));
 
         drop(client);
-        connection_task.abort();
 
         result.map(|_| ())
     }
@@ -359,5 +368,24 @@ mod tests {
             .expect("collect never fails");
 
         assert_eq!(snapshot.value, MAX_PROBES as f64);
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_spawned_connection_task_on_timeout() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let probe_like = async move {
+            let _guard = AbortOnDrop(tokio::spawn(async move {
+                let _keep_alive = tx;
+                std::future::pending::<()>().await;
+            }));
+            std::future::pending::<()>().await;
+        };
+
+        let _ = tokio::time::timeout(Duration::from_millis(15), probe_like).await;
+        let closed = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("spawned task must abort promptly when outer future times out");
+        assert!(closed.is_err(), "aborted task drops oneshot sender");
     }
 }

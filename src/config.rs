@@ -1,7 +1,25 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Production configuration path installed by `scripts/deploy.sh`.
+pub const PROD_CONFIG_PATH: &str = "/opt/guardianrs/guardian.yaml";
+
+/// Production `.env` path paired with `PROD_CONFIG_PATH` (`I3.3`).
+pub const PROD_ENV_PATH: &str = "/opt/guardianrs/.env";
+
+/// Local/development configuration path.
+pub const DEV_CONFIG_PATH: &str = "configs/guardian.yaml";
+
+/// Local/development `.env` path.
+pub const DEV_ENV_PATH: &str = ".env";
+
+/// Default durable state path on production hosts (`/var/lib/guardianrs/state.json`).
+pub const DEFAULT_PROD_STATE_PATH: &str = "/var/lib/guardianrs/state.json";
+
+/// Default durable outbox path on production hosts (`/var/lib/guardianrs/outbox.json`).
+pub const DEFAULT_PROD_OUTBOX_PATH: &str = "/var/lib/guardianrs/outbox.json";
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -32,6 +50,7 @@ pub enum ConfigError {
 /// Loaded from a YAML file with secrets sourced from environment variables.
 /// No hardcoded values — all operational parameters are externalized.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuardianConfig {
     pub daemon: DaemonConfig,
     pub thresholds: ThresholdsConfig,
@@ -90,6 +109,7 @@ impl Default for DigestConfig {
 /// root-equivalent `docker` group membership, so socket access must be opted into
 /// explicitly rather than attempted whenever the `docker:` block is absent.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DockerConfig {
     /// Whether the Docker collector runs at all.
     #[serde(default)]
@@ -186,6 +206,7 @@ fn default_verify_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Seconds between each collection cycle.
     pub poll_interval_secs: u64,
@@ -257,6 +278,7 @@ fn default_postgres_failures_critical() -> f64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThresholdsConfig {
     /// CPU usage percent that triggers a warning alert.
     pub cpu_warning: f64,
@@ -324,6 +346,7 @@ fn default_postgres_connect_timeout_secs() -> u64 {
 /// *name* of the environment variable that holds it, exactly like the Discord
 /// webhook. A configuration file is therefore safe to commit.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresConfig {
     /// Whether the PostgreSQL probes run at all.
     #[serde(default)]
@@ -338,6 +361,7 @@ pub struct PostgresConfig {
 
 /// One database to watch.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresInstanceConfig {
     /// What alerts call this database. Use the project name.
     ///
@@ -395,6 +419,7 @@ impl PostgresInstanceConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotificationConfig {
     pub discord: DiscordConfig,
 }
@@ -429,6 +454,7 @@ impl<'de> Deserialize<'de> for DiscordConfig {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             enabled: bool,
             webhook_url_env: String,
@@ -609,6 +635,12 @@ fn validate_discord_webhook_url(raw: &str) -> Result<String, ConfigError> {
         });
     };
 
+    if host.contains('@') {
+        return Err(ConfigError::Invalid {
+            details: "Discord webhook URL must not contain userinfo (@)".to_string(),
+        });
+    }
+
     let host_lower = host.to_ascii_lowercase();
     if !ALLOWED_DISCORD_HOSTS.contains(&host_lower.as_str()) {
         return Err(ConfigError::Invalid {
@@ -726,6 +758,15 @@ pub fn load(path: &str) -> Result<GuardianConfig, ConfigError> {
 
     // Referential check: a task naming an instance that does not exist would only
     // fail at 03:30, when nobody is awake to read it.
+    let mut task_names: HashSet<&str> = HashSet::new();
+    for task in &config.maintenance.tasks {
+        if !task_names.insert(task.name.as_str()) {
+            return Err(ConfigError::Invalid {
+                details: format!("maintenance task {:?} is declared twice", task.name),
+            });
+        }
+    }
+
     if config.maintenance.enabled && !config.maintenance.tasks.is_empty() {
         if !config.postgres.enabled {
             return Err(ConfigError::Invalid {
@@ -772,6 +813,57 @@ impl DiscordConfig {
             .as_deref()
             .ok_or(ConfigError::WebhookNotResolved)
     }
+}
+
+/// Select the `(config_path, env_path)` pair deterministically (`I3.3`).
+///
+/// When `/opt/guardianrs/guardian.yaml` exists, `.env` resolution is anchored to
+/// `/opt/guardianrs/.env` rather than trusting the caller's working directory.
+pub fn resolve_startup_files(prod_config_exists: bool) -> (&'static str, &'static str) {
+    if prod_config_exists {
+        (PROD_CONFIG_PATH, PROD_ENV_PATH)
+    } else {
+        (DEV_CONFIG_PATH, DEV_ENV_PATH)
+    }
+}
+
+fn sibling_outbox_path(state_path: &Path) -> PathBuf {
+    match state_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("outbox.json"),
+        _ => PathBuf::from("outbox.json"),
+    }
+}
+
+/// Resolve `(state_path, outbox_path)` for maintenance/digest state and Discord
+/// delivery spooling (`I2.2`, `I4.2`).
+///
+/// In production (`is_production == true`), omitted paths default to
+/// `/var/lib/guardianrs/state.json` and `/var/lib/guardianrs/outbox.json` even
+/// when the `maintenance` block is omitted from YAML. Bare relative filenames
+/// such as `"state.json"` map cleanly to `"outbox.json"`.
+pub fn resolve_persistence_paths(
+    is_production: bool,
+    config: &GuardianConfig,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let state_path = config
+        .maintenance
+        .state_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| is_production.then(|| PathBuf::from(DEFAULT_PROD_STATE_PATH)));
+
+    let outbox_path = config
+        .notification
+        .discord
+        .outbox_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| state_path.as_deref().map(sibling_outbox_path))
+        .or_else(|| is_production.then(|| PathBuf::from(DEFAULT_PROD_OUTBOX_PATH)));
+
+    (state_path, outbox_path)
 }
 
 #[cfg(test)]
@@ -966,6 +1058,43 @@ postgres:
         std::env::remove_var(VAR);
     }
 
+    #[test]
+    fn duplicate_maintenance_task_names_are_rejected() {
+        const VAR: &str = "GUARDIAN_TEST_DUPLICATE_TASK";
+        std::env::set_var(VAR, "s3cret");
+
+        let yaml = format!(
+            "{LEGACY_YAML}
+postgres:
+  enabled: true
+  instances:
+    - name: auditor
+      host: 127.0.0.1
+      port: 5432
+      database: auditor
+      user: guardian
+      password_env: {VAR}
+maintenance:
+  enabled: true
+  tasks:
+    - name: nightly
+      kind: postgres_backup
+      daily_at: '03:30'
+      instance: auditor
+    - name: nightly
+      kind: postgres_backup
+      daily_at: '03:40'
+      instance: auditor
+"
+        );
+
+        let error = load_from_temp(&yaml).expect_err("duplicate task names must be fatal");
+
+        assert!(error.to_string().contains("twice"), "error was: {error}");
+
+        std::env::remove_var(VAR);
+    }
+
     /// A maintenance task whose instance nobody declared would only fail at 03:30,
     /// when nobody is awake to read the error.
     #[test]
@@ -1150,11 +1279,14 @@ postgres:
             "https://evil.example.com/api/webhooks/123/token",
             "https://discord.com/api/webhooks/123/",
             "https://discord.com/other/path",
+            "https://user:secret@discord.com/api/webhooks/123/token",
         ] {
             std::env::set_var(VAR, invalid);
+            let err = load_from_temp(&enabled_yaml)
+                .expect_err(&format!("expected invalid webhook URL {invalid:?} to fail"));
             assert!(
-                load_from_temp(&enabled_yaml).is_err(),
-                "expected invalid webhook URL {invalid:?} to fail"
+                !err.to_string().contains("secret"),
+                "webhook URL validation error must never echo userinfo secrets: {err}"
             );
         }
 
@@ -1169,5 +1301,74 @@ postgres:
         );
 
         std::env::remove_var(VAR);
+    }
+
+    #[test]
+    fn invalid_digest_daily_at_is_rejected() {
+        for bad in ["25:00", "invalid", "08:60", ""] {
+            let yaml = format!("{LEGACY_YAML}\ndigest:\n  enabled: true\n  daily_at: {bad:?}\n");
+            let err = load_from_temp(&yaml).expect_err("invalid digest.daily_at must fail load");
+            assert!(
+                err.to_string().contains("digest.daily_at"),
+                "error must name digest.daily_at for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_non_temperature_thresholds_are_rejected() {
+        let neg_cpu = LEGACY_YAML.replace("cpu_warning: 80", "cpu_warning: -5");
+        let err = load_from_temp(&neg_cpu).expect_err("negative cpu_warning must fail");
+        assert!(err.to_string().contains("non-negative"), "error was: {err}");
+
+        // Ambient/board temperature sensors in cold rooms may legitimately use negative bounds.
+        let neg_temp = LEGACY_YAML
+            .replace("temp_warning: 70", "temp_warning: -10")
+            .replace("temp_critical: 80", "temp_critical: 50");
+        assert!(load_from_temp(&neg_temp).is_ok());
+    }
+
+    #[test]
+    fn startup_and_persistence_paths_resolve_deterministically() {
+        assert_eq!(
+            resolve_startup_files(true),
+            ("/opt/guardianrs/guardian.yaml", "/opt/guardianrs/.env")
+        );
+        assert_eq!(
+            resolve_startup_files(false),
+            ("configs/guardian.yaml", ".env")
+        );
+
+        // 1. Omitted `maintenance` block in production defaults both paths to /var/lib/guardianrs.
+        let omitted: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("parses");
+        assert_eq!(
+            resolve_persistence_paths(true, &omitted),
+            (
+                Some(PathBuf::from("/var/lib/guardianrs/state.json")),
+                Some(PathBuf::from("/var/lib/guardianrs/outbox.json"))
+            )
+        );
+        assert_eq!(resolve_persistence_paths(false, &omitted), (None, None));
+
+        // 2. Bare relative `"state.json"` whose `.parent()` is `Some("")` maps to `"outbox.json"`.
+        let mut bare_state: GuardianConfig = serde_yaml::from_str(LEGACY_YAML).expect("parses");
+        bare_state.maintenance.state_path = Some("state.json".to_string());
+        assert_eq!(
+            resolve_persistence_paths(false, &bare_state),
+            (
+                Some(PathBuf::from("state.json")),
+                Some(PathBuf::from("outbox.json"))
+            )
+        );
+
+        // 3. Explicit `discord.outbox_path` overrides sibling derivation.
+        bare_state.notification.discord.outbox_path = Some("/custom/outbox.json".to_string());
+        assert_eq!(
+            resolve_persistence_paths(true, &bare_state),
+            (
+                Some(PathBuf::from("state.json")),
+                Some(PathBuf::from("/custom/outbox.json"))
+            )
+        );
     }
 }
